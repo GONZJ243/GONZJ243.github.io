@@ -44,3 +44,7 @@ body {
 .Select-menu-outer {
     display : block !important;
 }
+
+.Select-control {
+     display : block !important;
+}   
