@@ -46,5 +46,5 @@ body {
 }
 
 .Select-control {display : block !important;}   
-
+.dash-table-container .dropdown { position: static; }
 .dash-table-container .dropdown.dropdown { position: static; }
