@@ -1,0 +1,34 @@
+div{
+  display:inline-block;
+  float:left;
+  color:#fff;
+  font-size:40px;
+}
+
+.one{
+  width:150px;
+  height:200px;
+  background:red;
+}
+
+.two{
+    width:100px;
+  height:200px;
+  background:lightgreen;
+}
+
+.three{
+    width:100px;
+  height:200px;
+}
+
+.four{
+  width:100px;
+  height:100px;
+background:darkblue;
+}
+.five{
+  width:100px;
+  height:100px;
+background:blue;
+}
