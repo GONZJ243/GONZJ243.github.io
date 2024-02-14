@@ -22,3 +22,9 @@
     grid-area: s4;
     background-color: #FF00E4;
 }
+
+label {
+    color: #F2F2F8;
+    padding: 10px;
+    
+}
