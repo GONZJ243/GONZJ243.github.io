@@ -1,34 +1,24 @@
-div{
-  display:inline-block;
-  float:left;
-  color:#fff;
-  font-size:40px;
+.grid { 
+    display: grid;
+    grid-template-columns: 10rem 7rem 7rem 7rem;
+    grid-template-rows: 7rem 7rem;
+    grid-template-areas: 
+    "s1 s2 s3"
+    "s1 s2 s4"
 }
-
-.one{
-  width:150px;
-  height:200px;
-  background:red;
+.s1 { 
+    grid-area: s1;
+    background-color: #FF0000;
 }
-
-.two{
-    width:100px;
-  height:200px;
-  background:lightgreen;
+.s2 { 
+    grid-area: s2;
+    background-color: #00FF36;
 }
-
-.three{
-    width:100px;
-  height:200px;
+.s3 { 
+    grid-area: s3;
+    background-color: #0030FF;
 }
-
-.four{
-  width:100px;
-  height:100px;
-background:darkblue;
-}
-.five{
-  width:100px;
-  height:100px;
-background:blue;
+.s4 {
+    grid-area: s4;
+    background-color: #FF00E4;
 }
