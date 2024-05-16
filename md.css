@@ -2,3 +2,7 @@
   background-color: #0000C9;
   color: #FFFFFF
 }
+
+.Select-menu-outer {
+display : block !important;
+}
