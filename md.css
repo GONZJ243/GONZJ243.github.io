@@ -4,5 +4,9 @@
 }
 
 .Select-menu-outer {
-display : block !important;
+  display: block !important;
+}
+
+.dash-table-container .dropdown {
+  position: static;
 }
