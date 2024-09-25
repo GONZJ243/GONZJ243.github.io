@@ -7,31 +7,19 @@ $$
     var delete_sql = "DELETE FROM merged_table";
     snowflake.execute(delete_sql);
 
-    // Step 2: Define the SQL for the insert operation
-    var sql = "INSERT INTO merged_table (";
-    var manual_columns = [];
-
-    // Get the columns from manual_data
-    var result = snowflake.execute(
-        `SELECT COLUMN_NAME 
-         FROM INFORMATION_SCHEMA.COLUMNS 
-         WHERE TABLE_NAME = 'MANUAL_DATA'`
-    );
-
-    // Construct the column list with prefixes
-    while (result.next()) {
-        var column_name = result.getColumnValue(1);
-        manual_columns.push("m." + column_name + " AS m_" + column_name);
-    }
-
-    // Combine system_data columns with the prefixed manual_data columns
-    var system_columns = "s.*, " + manual_columns.join(", ");
-
-    // Construct the full SQL query for inserting into merged_table
-    sql += system_columns + ") " +
-           "SELECT " + system_columns + 
-           " FROM system_data s " + 
-           "LEFT JOIN manual_data m ON s.primary_key = m.primary_key";
+    // Step 2: Construct the SQL for the insert operation
+    var sql = `
+        INSERT INTO merged_table 
+        SELECT 
+            s.*, 
+            m.field1 AS m_field1,  -- Replace with actual field names
+            m.field2 AS m_field2,  -- Replace with actual field names
+            m.field3 AS m_field3,  -- Replace with actual field names
+            m.fieldN AS m_fieldN   -- Replace with actual field names
+        FROM 
+            system_data s
+        LEFT JOIN 
+            manual_data m ON s.primary_key = m.primary_key`;
 
     // Step 3: Execute the constructed SQL to insert new data
     snowflake.execute(sql);
