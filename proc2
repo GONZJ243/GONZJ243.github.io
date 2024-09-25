@@ -1,60 +1,40 @@
-CREATE OR REPLACE PROCEDURE update_target_table()
+CREATE OR REPLACE PROCEDURE update_merged_table()
 RETURNS STRING
 LANGUAGE JAVASCRIPT
 AS
 $$
-    try {
-        // Begin the transaction
-        snowflake.createStatement({sqlText: 'BEGIN'}).execute();
-        
-        // Define the SQL query to retrieve necessary fields from SOURCE_TABLE
-        var sql_query = 
-            'SELECT field_to_update, newvalue, row_loc, row_mat, user ' +
-            'FROM SOURCE_TABLE';
-        
-        // Execute the query
-        var stmt1 = snowflake.createStatement({sqlText: sql_query});
-        var result_set = stmt1.execute();
-        
-        // Process each row in the result set
-        while (result_set.next()) {
-            // Retrieve the values from the current row
-            var fieldToUpdate = result_set.getColumnValue(1);
-            var newValue = result_set.getColumnValue(2);
-            var rowLoc = result_set.getColumnValue(3);
-            var rowMat = result_set.getColumnValue(4);
-            var user = result_set.getColumnValue(5);
-            
-            // Construct and execute the UPDATE statement for TARGET_TABLE
-            var updateStatement = 
-                'UPDATE TARGET_TABLE ' +
-                'SET "' + fieldToUpdate + '" = \'' + newValue + '\', ' +
-                '"' + fieldToUpdate + '_TIMESTAMP" = CURRENT_TIMESTAMP(), ' +
-                '"' + fieldToUpdate + '_EDITOR" = \'' + user + '\' ' +
-                'WHERE PLANT_KEY = \'' + rowLoc + '\' ' +
-                'AND MATERIAL = \'' + rowMat + '\'';
-            
-            var stmt2 = snowflake.createStatement({sqlText: updateStatement});
-            stmt2.execute();
-            
-            // Construct and execute the DELETE statement for SOURCE_TABLE
-            var deleteStatement = 
-                'DELETE FROM SOURCE_TABLE ' +
-                'WHERE field_to_update = \'' + fieldToUpdate + '\' ' +
-                'AND row_loc = \'' + rowLoc + '\' ' +
-                'AND row_mat = \'' + rowMat + '\'';
-            
-            var stmt3 = snowflake.createStatement({sqlText: deleteStatement});
-            stmt3.execute();
-        }
-        
-        // Commit the transaction
-        snowflake.createStatement({sqlText: 'COMMIT'}).execute();
-        
-        return 'Update and delete procedure executed successfully.';
-    } catch (err) {
-        // Rollback in case of any error
-        snowflake.createStatement({sqlText: 'ROLLBACK'}).execute();
-        return 'Error: ' + err.message;
+    // Step 1: Delete existing data in merged_table
+    var delete_sql = "DELETE FROM merged_table";
+    snowflake.execute(delete_sql);
+
+    // Step 2: Define the SQL for the insert operation
+    var sql = "INSERT INTO merged_table (";
+    var manual_columns = [];
+
+    // Get the columns from manual_data
+    var result = snowflake.execute(
+        `SELECT COLUMN_NAME 
+         FROM INFORMATION_SCHEMA.COLUMNS 
+         WHERE TABLE_NAME = 'MANUAL_DATA'`
+    );
+
+    // Construct the column list with prefixes
+    while (result.next()) {
+        var column_name = result.getColumnValue(1);
+        manual_columns.push("m." + column_name + " AS m_" + column_name);
     }
+
+    // Combine system_data columns with the prefixed manual_data columns
+    var system_columns = "s.*, " + manual_columns.join(", ");
+
+    // Construct the full SQL query for inserting into merged_table
+    sql += system_columns + ") " +
+           "SELECT " + system_columns + 
+           " FROM system_data s " + 
+           "LEFT JOIN manual_data m ON s.primary_key = m.primary_key";
+
+    // Step 3: Execute the constructed SQL to insert new data
+    snowflake.execute(sql);
+
+    return 'Merged table updated successfully.';
 $$;
