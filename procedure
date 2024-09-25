@@ -1,0 +1,47 @@
+CREATE OR REPLACE PROCEDURE update_target_table()
+RETURNS STRING
+LANGUAGE JAVASCRIPT
+AS
+$$
+    // Define the SQL query to retrieve necessary fields from TARGET_TABLE
+    var sql_query = 
+        'SELECT field_to_update, newvalue, row_loc, row_mat, user ' +
+        'FROM TARGET_TABLE';
+    
+    // Execute the query
+    var stmt1 = snowflake.createStatement({sqlText: sql_query});
+    var result_set = stmt1.execute();
+    
+    // Initialize an array to hold update statements
+    var updateStatements = [];
+    
+    // Process each row in the result set
+    while (result_set.next()) {
+        // Retrieve the values from the current row
+        var fieldToUpdate = result_set.getColumnValue(1);
+        var newValue = result_set.getColumnValue(2);
+        var rowLoc = result_set.getColumnValue(3);
+        var rowMat = result_set.getColumnValue(4);
+        var user = result_set.getColumnValue(5);
+        
+        // Construct the UPDATE statement
+        var updateStatement = 
+            'UPDATE TARGET_TABLE ' +
+            'SET "' + fieldToUpdate + '" = \'' + newValue + '\', ' +
+            '"' + fieldToUpdate + '_TIMESTAMP" = CURRENT_TIMESTAMP(), ' +
+            '"' + fieldToUpdate + '_EDITOR" = \'' + user + '\' ' +
+            'WHERE PLANT_KEY = \'' + rowLoc + '\' ' +
+            'AND MATERIAL = \'' + rowMat + '\'';
+        
+        // Add the update statement to the array
+        updateStatements.push(updateStatement);
+    }
+    
+    // Execute each update statement
+    for (var i = 0; i < updateStatements.length; i++) {
+        var stmt2 = snowflake.createStatement({sqlText: updateStatements[i]});
+        stmt2.execute();
+    }
+    
+    return 'Update procedure executed successfully.';
+$$;
