@@ -1,0 +1,91 @@
+import dash
+from dash import html, dcc, Input, Output
+
+app = dash.Dash(__name__)
+app.title = 'Multi-Page App in One File'
+
+# ------------------------------------------
+# Predefined layouts (clean and modular)
+# ------------------------------------------
+
+home_layout = html.Div([
+    html.H3("🏠 Home"),
+    html.P("Welcome to the Home screen!")
+])
+
+dashboard_layout = html.Div([
+    html.H3("📊 Dashboard"),
+    html.P("This is the Dashboard screen.")
+])
+
+metrics_layout = html.Div([
+    html.H3("📈 Metrics"),
+    html.P("This is the Metrics screen.")
+])
+
+# ------------------------------------------
+# Main app layout with sidebar and content
+# ------------------------------------------
+
+app.layout = html.Div([
+    dcc.Location(id='url', refresh=False),
+
+    # Sidebar
+    html.Div([
+        html.H2("Navigation", style={"text-align": "center"}),
+        html.Hr(),
+        html.Button("Home", id="btn-home", n_clicks=0, style={"width": "100%"}),
+        html.Button("Dashboard", id="btn-dashboard", n_clicks=0, style={"width": "100%", "margin-top": "10px"}),
+        html.Button("Metrics", id="btn-metrics", n_clicks=0, style={"width": "100%", "margin-top": "10px"}),
+    ], style={
+        "position": "fixed",
+        "top": 0,
+        "left": 0,
+        "bottom": 0,
+        "width": "200px",
+        "padding": "20px",
+        "background-color": "#f8f9fa"
+    }),
+
+    # Main page content
+    html.Div(id='page-content', style={"margin-left": "220px", "padding": "20px"})
+])
+
+# ------------------------------------------
+# Callbacks: navigation and page rendering
+# ------------------------------------------
+
+@app.callback(
+    Output('url', 'pathname'),
+    [Input('btn-home', 'n_clicks'),
+     Input('btn-dashboard', 'n_clicks'),
+     Input('btn-metrics', 'n_clicks')]
+)
+def navigate(n_home, n_dash, n_metrics):
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return "/"
+    button_id = ctx.triggered[0]["prop_id"].split(".")[0]
+    if button_id == "btn-home":
+        return "/"
+    elif button_id == "btn-dashboard":
+        return "/dashboard"
+    elif button_id == "btn-metrics":
+        return "/metrics"
+    return "/"
+
+@app.callback(
+    Output('page-content', 'children'),
+    Input('url', 'pathname')
+)
+def render_page(pathname):
+    if pathname == "/dashboard":
+        return dashboard_layout
+    elif pathname == "/metrics":
+        return metrics_layout
+    return home_layout
+
+# ------------------------------------------
+
+if __name__ == '__main__':
+    app.run_server(debug=True)
