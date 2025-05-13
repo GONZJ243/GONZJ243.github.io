@@ -2,12 +2,13 @@ import dash
 from dash import html, dcc, Input, Output
 import dash_bootstrap_components as dbc
 
+# Initialize app with Bootstrap
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
 app.title = 'Sidebar Navigation App'
 
-# -------------------------------
-# Screen layouts
-# -------------------------------
+# --------------------------------------
+# Predefined screen layouts
+# --------------------------------------
 
 home_layout = dbc.Container([
     html.H3("🏠 Home", className="mb-4"),
@@ -63,9 +64,9 @@ metrics_layout = dbc.Container([
     ])
 ], fluid=True)
 
-# -------------------------------
-# App layout with sidebar
-# -------------------------------
+# --------------------------------------
+# Main app layout (must be top-level)
+# --------------------------------------
 
 app.layout = html.Div([
     dcc.Store(id='page-store', data='home'),
@@ -80,14 +81,14 @@ app.layout = html.Div([
             dbc.Button("Metrics", id="btn-metrics", color="primary", className="mb-2", n_clicks=0, style={"width": "100%"})
         ], width=2, style={"background-color": "#f8f9fa", "height": "100vh", "padding": "20px"}),
 
-        # Content area
+        # Main content
         dbc.Col(html.Div(id='page-content', style={"padding": "20px"}), width=10)
     ], className="g-0")
 ])
 
-# -------------------------------
+# --------------------------------------
 # Callbacks
-# -------------------------------
+# --------------------------------------
 
 @app.callback(
     Output('page-store', 'data'),
@@ -117,8 +118,3 @@ def render_page(screen):
     elif screen == 'metrics':
         return metrics_layout
     return home_layout
-
-# -------------------------------
-
-if __name__ == '__main__':
-    app.run_server(debug=True)
