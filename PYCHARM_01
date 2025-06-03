@@ -1,0 +1,142 @@
+import dash
+from dash import Dash, html, dcc, Input, Output, State, ctx
+import dash_ag_grid as dag
+import pandas as pd
+import dash_bootstrap_components as dbc
+
+# Mock data loading (replace with actual data loading logic)
+projects_df = pd.DataFrame({
+    'ProjectID': [1, 2],
+    'ProjectName': ['Alpha', 'Beta'],
+    'LAN_ID': ['user1', 'user2'],
+    'Description': ['Test A', 'Test B']
+})
+
+users_df = pd.DataFrame({
+    'LAN_ID': ['user1', 'user2', 'user3'],
+    'Name': ['Alice', 'Bob', 'Charlie']
+})
+
+areas_df = pd.DataFrame({
+    'AreaID': [1, 2],
+    'AreaName': ['Supply Chain', 'Logistics']
+})
+
+roles_df = pd.DataFrame({
+    'LAN_ID': ['user1', 'user2'],
+    'Role': ['Manager', 'Analyst']
+})
+
+# Merge projects and roles
+df_merged = pd.merge(projects_df, roles_df, on='LAN_ID', how='left')
+
+# App initialization
+app = Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
+
+# Sidebar Navigation
+sidebar = html.Div([
+    html.H2("Navigation", className="display-6"),
+    html.Hr(),
+    dbc.Nav([
+        dbc.NavLink("Home", href="/", active="exact"),
+        dbc.NavLink("List", href="/list", active="exact"),
+        dbc.NavLink("Blueprint", href="/blueprint", active="exact"),
+        dbc.NavLink("Dimensions", href="/dimensions", active="exact"),
+        dbc.NavLink("Gantt", href="/gantt", active="exact"),
+        dbc.NavLink("Roadmap", href="/roadmap", active="exact"),
+        dbc.NavLink("Charter", href="/charter", active="exact"),
+    ], vertical=True, pills=True),
+], style={"position": "fixed", "top": 0, "left": 0, "bottom": 0, "width": "16rem", "padding": "2rem 1rem", "background-color": "#f8f9fa"})
+
+# AgGrid config
+grid_columns = [{"field": i} for i in projects_df.columns]
+grid_data = projects_df.to_dict("records")
+
+# Home screen layout
+home_layout = html.Div([
+    html.H3("Projects Overview"),
+    dag.AgGrid(
+        id='projects-grid',
+        columnDefs=grid_columns,
+        rowData=grid_data,
+        columnSize="sizeToFit",
+        rowSelection="single"
+    ),
+    html.Br(),
+    html.Div(id='edit-mode-div')
+], style={"margin-left": "18rem", "padding": "2rem 1rem"})
+
+# Main layout
+app.layout = html.Div([
+    dcc.Location(id="url"),
+    sidebar,
+    html.Div(id="page-content")
+])
+
+# Callback to switch screens
+@app.callback(
+    Output("page-content", "children"),
+    Input("url", "pathname")
+)
+def display_page(pathname):
+    if pathname == "/":
+        return home_layout
+    return html.Div(html.H3(f"{pathname[1:].capitalize()} Screen"), style={"margin-left": "18rem", "padding": "2rem 1rem"})
+
+# Callback to enter edit mode
+@app.callback(
+    Output('edit-mode-div', 'children'),
+    Input('projects-grid', 'selectedRows')
+)
+def enter_edit_mode(selected):
+    if not selected:
+        return html.Div()
+
+    project = selected[0]
+    role_fields = ['Role 1', 'Role 2', 'Role 3', 'Role 4']
+
+    role_editors = [
+        dbc.Row([
+            dbc.Label(role, width=2),
+            dbc.Col(dcc.Dropdown(
+                id=f"dropdown-{role}",
+                options=[{"label": row.Name, "value": row.LAN_ID} for _, row in users_df.iterrows()],
+                multi=True
+            ), width=10)
+        ]) for role in role_fields
+    ]
+
+    return html.Div([
+        html.H4(f"Edit Project: {project['ProjectName']}"),
+        dbc.Form([
+            dbc.Row([
+                dbc.Label("Project Name", width=2),
+                dbc.Col(dcc.Input(value=project['ProjectName'], id="edit-project-name", type="text"), width=10)
+            ]),
+            dbc.Row([
+                dbc.Label("Description", width=2),
+                dbc.Col(dcc.Textarea(value=project['Description'], id="edit-description"), width=10)
+            ]),
+            html.Hr(),
+            html.H5("Assign Roles"),
+            *role_editors,
+            html.Br(),
+            dbc.Button("Save", id="save-button", color="success")
+        ])
+    ])
+
+# Placeholder callback for save button
+@app.callback(
+    Output('save-button', 'children'),
+    Input('save-button', 'n_clicks'),
+    State('edit-project-name', 'value'),
+    State('edit-description', 'value'),
+    prevent_initial_call=True
+)
+def save_changes(n_clicks, name, desc):
+    # Replace with logic to save to database
+    print(f"Saving: {name}, {desc}")
+    return "Saved!"
+
+if __name__ == '__main__':
+    app.run_server(debug=True)
