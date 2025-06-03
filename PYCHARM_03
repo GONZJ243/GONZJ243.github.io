@@ -1,0 +1,200 @@
+import dash
+from dash import Dash, html, dcc, Input, Output, State, ctx
+import dash_ag_grid as dag
+import dash_bootstrap_components as dbc
+import pandas as pd
+import json
+
+# -------------------------
+# Mock Data
+# -------------------------
+projects_df = pd.DataFrame({
+    'ProjectID': [1, 2],
+    'ProjectName': ['Alpha', 'Beta'],
+    'Description': ['Test A', 'Test B'],
+    'Role1': [['user1'], ['user2']],
+    'Role2': [['user3'], []],
+    'Role3': [[], []],
+    'Role4': [[], []]
+})
+
+users_df = pd.DataFrame({
+    'LAN_ID': ['user1', 'user2', 'user3'],
+    'Name': ['Alice', 'Bob', 'Charlie']
+})
+
+areas_df = pd.DataFrame({
+    'AreaID': [1, 2],
+    'AreaName': ['Supply Chain', 'Logistics']
+})
+
+roles_df = pd.DataFrame({
+    'LAN_ID': ['user1', 'user2'],
+    'Role': ['Manager', 'Analyst']
+})
+
+# -------------------------
+# Helper Functions
+# -------------------------
+def get_project_by_id(pid):
+    row = projects_df[projects_df['ProjectID'] == pid]
+    return row.iloc[0] if not row.empty else None
+
+def update_project_record(pid, name, desc, roles):
+    global projects_df
+    idx = projects_df[projects_df['ProjectID'] == pid].index[0]
+    projects_df.at[idx, 'ProjectName'] = name
+    projects_df.at[idx, 'Description'] = desc
+    for i, role in enumerate(['Role1', 'Role2', 'Role3', 'Role4']):
+        projects_df.at[idx, role] = roles[i]
+
+# -------------------------
+# Layout Elements
+# -------------------------
+
+def sidebar():
+    return html.Div([
+        html.H2("Menu", className="display-6"),
+        html.Hr(),
+        dbc.Nav([
+            dbc.NavLink("Home", href="/", active="exact"),
+            dbc.NavLink("List", href="/list", active="exact"),
+            dbc.NavLink("Blueprint", href="/blueprint", active="exact"),
+            dbc.NavLink("Dimensions", href="/dimensions", active="exact"),
+            dbc.NavLink("Gantt", href="/gantt", active="exact"),
+            dbc.NavLink("Roadmap", href="/roadmap", active="exact"),
+            dbc.NavLink("Charter", href="/charter", active="exact"),
+        ], vertical=True, pills=True),
+    ], style={"position": "fixed", "top": 0, "left": 0, "bottom": 0, "width": "16rem", "padding": "2rem 1rem", "background-color": "#f8f9fa"})
+
+def home_layout():
+    grid_cols = [{"field": col} for col in projects_df.columns if col not in ['Role1', 'Role2', 'Role3', 'Role4']]
+    grid_data = projects_df.drop(columns=['Role1', 'Role2', 'Role3', 'Role4']).to_dict("records")
+
+    return html.Div([
+        html.H3("Projects Overview"),
+        dag.AgGrid(
+            id='project-grid',
+            columnDefs=grid_cols,
+            rowData=grid_data,
+            rowSelection='single',
+            columnSize="sizeToFit"
+        ),
+        html.Hr(),
+        dbc.Modal([
+            dbc.ModalHeader("Edit Project", id="modal-title"),
+            dbc.ModalBody(id="modal-body"),
+            dbc.ModalFooter([
+                dbc.Button("Save", id="save-button", color="success"),
+                dbc.Button("Close", id="close-modal", className="ms-2")
+            ])
+        ], id="edit-modal", is_open=False),
+        html.Div(id='save-feedback')
+    ], style={"margin-left": "18rem", "padding": "2rem 1rem"})
+
+def generic_layout(name):
+    return html.Div(html.H3(f"{name} Screen"), style={"margin-left": "18rem", "padding": "2rem 1rem"})
+
+# -------------------------
+# App Initialization
+# -------------------------
+app = Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
+app.layout = html.Div([
+    dcc.Location(id='url'),
+    sidebar(),
+    dcc.Store(id='selected-project'),
+    html.Div(id='page-content')
+])
+
+# -------------------------
+# Callbacks
+# -------------------------
+@app.callback(
+    Output('page-content', 'children'),
+    Input('url', 'pathname')
+)
+def route(pathname):
+    if pathname == '/':
+        return home_layout()
+    return generic_layout(pathname[1:])
+
+@app.callback(
+    Output('edit-modal', 'is_open'),
+    Output('modal-body', 'children'),
+    Output('modal-title', 'children'),
+    Output('selected-project', 'data'),
+    Input('project-grid', 'selectedRows'),
+    State('edit-modal', 'is_open')
+)
+def toggle_modal(selected, is_open):
+    if not selected:
+        return False, dash.no_update, dash.no_update, dash.no_update
+
+    pid = selected[0]['ProjectID']
+    project = get_project_by_id(pid)
+    roles = [project['Role1'], project['Role2'], project['Role3'], project['Role4']]
+
+    role_dropdowns = []
+    for i in range(4):
+        role_dropdowns.append(
+            dbc.Row([
+                dbc.Label(f"Role {i+1}", width=2),
+                dbc.Col(dcc.Dropdown(
+                    id=f"role{i+1}-dropdown",
+                    options=[{"label": u.Name, "value": u.LAN_ID} for _, u in users_df.iterrows()],
+                    value=roles[i],
+                    multi=True
+                ), width=10)
+            ], className="mb-2")
+        )
+
+    body = dbc.Form([
+        dbc.Row([
+            dbc.Label("Name", width=2),
+            dbc.Col(dcc.Input(value=project['ProjectName'], id="project-name", type="text"), width=10)
+        ], className="mb-2"),
+        dbc.Row([
+            dbc.Label("Description", width=2),
+            dbc.Col(dcc.Textarea(value=project['Description'], id="project-desc"), width=10)
+        ], className="mb-2"),
+        html.Hr(),
+        html.H5("Assign Roles"),
+        *role_dropdowns
+    ])
+
+    return True, body, f"Edit Project: {project['ProjectName']}", pid
+
+@app.callback(
+    Output('save-feedback', 'children'),
+    Output('edit-modal', 'is_open', allow_duplicate=True),
+    Input('save-button', 'n_clicks'),
+    State('selected-project', 'data'),
+    State('project-name', 'value'),
+    State('project-desc', 'value'),
+    State('role1-dropdown', 'value'),
+    State('role2-dropdown', 'value'),
+    State('role3-dropdown', 'value'),
+    State('role4-dropdown', 'value'),
+    prevent_initial_call=True
+)
+def save_changes(n, pid, name, desc, r1, r2, r3, r4):
+    try:
+        update_project_record(pid, name, desc, [r1, r2, r3, r4])
+        return dbc.Toast("✅ Project saved successfully!", header="Success", icon="success", duration=3000), False
+    except Exception as e:
+        return dbc.Toast(f"❌ Error: {e}", header="Error", icon="danger", duration=3000), False
+
+@app.callback(
+    Output('edit-modal', 'is_open', allow_duplicate=True),
+    Input('close-modal', 'n_clicks'),
+    State('edit-modal', 'is_open'),
+    prevent_initial_call=True
+)
+def close_modal(n, is_open):
+    return False
+
+# -------------------------
+# Run App
+# -------------------------
+if __name__ == '__main__':
+    app.run_server(debug=True)
