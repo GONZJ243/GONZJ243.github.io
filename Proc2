@@ -1,0 +1,10 @@
+var fieldtoupdate = "status";
+var newValue = "shipped";
+var rowId = 123;
+
+var updateStatement = 
+    "UPDATE table1 " +
+    "SET ''" + fieldtoupdate + "'' = ''" + newValue + "'' " +
+    "WHERE ID = ''" + rowId + "''";
+
+console.log(updateStatement);
