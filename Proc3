@@ -1,0 +1,5 @@
+var updateStatement = 
+    'UPDATE TARGET_TABLE ' +
+    'SET "' + fieldToUpdate + '" = \'' + newValue + '\' ' +
+    'WHERE PLANT_KEY = \'' + rowLoc + '\' ' +
+    'AND MATERIAL = \'' + rowMat + '\'';
