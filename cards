@@ -1,0 +1,12 @@
+trust_card = dbc.Card(
+    dbc.Row([
+        html.Div(style = {**trust_style, 'width':'5px','border-radius':'8px 0 0 8px', 'padding-right':'10px'}),
+        dbc.Col([
+            html.H4('Trust is Everything', style = {**card_title, **trust_font}),
+            html.P(trust_count, style = {**card_body}),
+        ],
+        style = {'margin-left':'10px'})
+    ], 
+        className="g-0"
+    )
+    , style=card_style)
