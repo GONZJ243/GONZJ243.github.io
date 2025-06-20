@@ -1,0 +1,211 @@
+Layout definition:
+
+app.layout = html.Div(id="main-content-div")
+
+dynamic layout selection, based on sidebar button selection:
+
+@app.callback(
+    Output('page-store', 'data'),
+    [
+        Input('sidebar-btn-home', 'n_clicks'),
+        Input('sidebar-btn-list', 'n_clicks'),
+        Input('sidebar-btn-blue', 'n_clicks'),
+        Input('sidebar-btn-dims', 'n_clicks'),
+        Input('sidebar-btn-gant', 'n_clicks'),
+        Input('sidebar-btn-road', 'n_clicks'),
+        Input('sidebar-btn-char', 'n_clicks')
+    ],
+    prevent_initial_call=True)
+def update_page(n_home, n_list, n_blueprint, n_dimensions, n_gantt, n_roadmap, n_charter):
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return dash.no_update
+    button_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    return {
+        'sidebar-btn-home':'home',
+        'sidebar-btn-list':'list',
+        'sidebar-btn-blue':'blueprint',
+        'sidebar-btn-dims':'dimensions',
+        'sidebar-btn-gant':'gantt',
+        'sidebar-btn-road':'roadmap',
+        'sidebar-btn-char':'charter'
+    }.get(button_id, 'home')
+
+
+
+
+dynamic layout rendering:
+@app.callback(
+    Output('main-content-div', 'children'),
+    Input('page-store', 'data'))
+def render_page(screen):
+    if screen == 'blueprint':
+        return blueprint_layout
+    if screen == 'home':
+        return home_layout
+    elif screen == 'dimensions':
+        return dimensions_layout
+    elif screen == 'gantt':
+        return gantt_layout
+    elif screen == 'roadmap':
+        return roadmap_layout
+    elif screen == 'charter':
+        return charter_layout
+    elif screen == 'list':
+        return list_layout
+    return home_layout
+
+
+
+relevant layout definition:
+blueprint_layout = html.Div(
+    id="blueprint-layout-content",
+    style={"flexGrow":1, "padding":"30px","backgroundColor":"#f9fafa","width":"100%"},
+    children=[]
+)
+
+
+callback to render layout:
+@app.callback(
+    Output('blueprint-layout-content','children'),
+    Input('filter-project-mode','data')
+)
+
+def update_blueprint_view(filter_mode):
+    request_headers=dict(request.headers)
+    auth_info_browser=client.get_auth_info_from_browser_headers(request_headers)
+    logging.info((auth_info_browser))
+    logged_user = auth_info_browser["authIdentifier"].upper()
+    
+    initial_df = create_enriched_projects_df()
+    
+    filtered_projects = initial_df.copy()
+    
+    if filter_mode == "mine":
+        filtered_projects = projects_df[projects_df.ID.isin(
+            roles_df[roles_df.LAN_ID == logged_user].PROJECT_ID
+        )]
+    elif filter_mode == "team":
+        filtered_users = users_df[users_df.LEAD_LAN_ID == logged_user].LAN_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            roles_df[roles_df.LAN_ID.isin(filtered_users)].PROJECT_ID
+        )]
+    elif filter_mode == "off":
+        selected_projects = projects_df[projects_df.RISK == "Off Track"].PROJECT_ID
+        
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )] 
+    elif filter_mode == "on":
+        selected_projects = projects_df[projects_df.RISK == "On Track"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )]
+    elif filter_mode == "global":
+        selected_projects = projects_df[projects_df.REGION == "Global"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )]
+    elif filter_mode == "amer":
+        selected_projects = projects_df[projects_df.REGION == "Americas"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )]
+    elif filter_mode == "noam":
+        selected_projects = projects_df[projects_df.REGION == "North America"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )]
+    elif filter_mode == "latam":
+        selected_projects = projects_df[projects_df.REGION == "Latin America"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+       )]
+    else:
+        filtered_projects = projects_df
+    
+    
+    if filtered_projects.empty:
+        return []
+    
+    cards = []
+    for p in principles:
+        count = filtered_projects[filtered_projects['PRINCIPLE'] == p].shape[0]
+        data = principle_data[p]
+        card = create_card(data['title'], count, data['style']['background-color'])
+        cards.append(card)
+    return html.Div(cards)
+
+
+principles data:
+principles = [
+    'Trust is Everything',
+    'Science Will Win',
+    'Disruption Calls for Innovation',
+    'Time is Life',
+    'Execution Makes the Difference']
+
+principle_data = {
+    'Trust is Everything': {
+        "style":{"background-color":"#FF6609"},
+        "title":{"Trust is Everything"},
+        "count":"0"
+    },
+    
+    'Science Will Win': {
+       "style":{"background-color":"#FF6609"},
+        "title":{"Science Will Win"},
+        "count":"0" 
+    },
+    
+    'Disruption Calls for Innovation': {
+        "style":{"background-color":"#FF6609"},
+        "title":{"Disruption Calls for Innovation"},
+        "count":"0"
+    },
+    
+    'Time is Life':{
+        "style":{"background-color":"#FF6609"},
+        "title":{"Time is Life"},
+        "count":"0"
+    },
+    
+    'Execution Makes the Difference':{
+        "style":{"background-color":"#FF6609"},
+        "title":{"Execution Makes the Difference"},
+        "count":"0"
+    }
+}
+
+
+card creation:
+def create_card(title, count, color):
+    return html.Div([
+        html.Div(style={
+            'height':'6px',
+            'backgroundColor':color,
+            'borderTopLeftRadius':'10px',
+            'borderTopRightRadius':'10px'
+        }),
+        html.Div([
+            html.H4(title, style={
+                'fontSize':'18px',
+                'fontWeight':'600',
+                'margin':'10px 0 5px'
+            }),
+            html.P(f"{count} projects", style={
+                'fontSize':'16px',
+                'margin':'0',
+                'color':'#666'
+            })
+        ], style={'padding':'10px 15px'})
+    ], style={
+        'width':'220px',
+        'backgroundColor':'#fff',
+        'borderRadius':'10px',
+        'boxShadow':'0 4px 10px rgba(0,0,0,0.1)',
+        'margin':'10px',
+        'display':'inline-block',
+        'verticalAlign':'top'
+    })
+
