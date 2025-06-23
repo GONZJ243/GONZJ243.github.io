@@ -1,0 +1,33 @@
+CREATE OR REPLACE PROCEDURE process_edits()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+DECLARE
+    v_id STRING;
+    v_field STRING;
+    v_value STRING;
+    v_sql STRING;
+    c_edits CURSOR FOR SELECT ID, field_to_update, newValue FROM EDITS_TO_PROCESS;
+BEGIN
+    -- Open cursor and loop through all edits
+    FOR record IN c_edits DO
+        LET v_id = record.ID;
+        LET v_field = record.field_to_update;
+        LET v_value = record.newValue;
+
+        -- Dynamically construct SQL statement
+        LET v_sql = 'UPDATE PROJECTS SET ' || IDENTIFIER(:v_field) || ' = ' ||
+                    CASE 
+                        WHEN TRY_TO_NUMBER(v_value) IS NOT NULL THEN v_value
+                        ELSE '''' || REPLACE(v_value, '''', '''''') || ''''
+                    END ||
+                    ' WHERE field1 = ''' || REPLACE(v_id, '''', '''''') || '''';
+
+        -- Execute the SQL statement
+        EXECUTE IMMEDIATE :v_sql;
+    END FOR;
+
+    RETURN 'Edits processed successfully.';
+END;
+$$;
