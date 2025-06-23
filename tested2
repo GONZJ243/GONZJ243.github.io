@@ -1,0 +1,35 @@
+CREATE OR REPLACE PROCEDURE process_edits()
+RETURNS STRING
+LANGUAGE SQL
+AS
+DECLARE
+    v_id STRING;
+    v_field STRING;
+    v_value STRING;
+    v_sql STRING;
+    select_statement VARCHAR;
+    res RESULTSET;
+    c_edits CURSOR FOR res;
+BEGIN
+    select_statement := 'SELECT * FROM vaw_amer_dev.cxc.edits_to_process';
+    res := (EXECUTE IMMEDIATE :select_statement);
+
+    FOR row_variable IN c_edits DO
+        v_id := row_variable.ROW_ID;
+        v_field := row_variable.field_to_update;
+        v_value := row_variable.newValue;
+
+        -- Construct dynamic SQL as string
+        v_sql := 'UPDATE VAW_AMER_DEV.CXC.PROJECTS SET "' || v_field || '" = ' ||
+                    CASE 
+                        WHEN TRY_TO_NUMBER(v_value) IS NOT NULL THEN v_value
+                        ELSE '''' || REPLACE(v_value, '''', '''''') || ''''
+                    END ||
+                    ' WHERE ID = ''' || REPLACE(v_id, '''', '''''') || '''';
+
+        -- Execute the SQL statement
+        EXECUTE IMMEDIATE v_sql;
+    END FOR;
+
+    RETURN 'Edits processed successfully.';
+END;
