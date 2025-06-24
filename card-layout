@@ -1,0 +1,98 @@
+import dash_html_components as html
+
+card = html.Div(
+    className="task-wrapper",
+    children=[
+        # Left color indicator (customize backgroundColor dynamically)
+        html.Div(style={
+            "width": "6px",
+            "backgroundColor": "#ff4d4d",  # Dynamic color here
+            "borderTopLeftRadius": "12px",
+            "borderBottomLeftRadius": "12px"
+        }),
+
+        # Card content
+        html.Div(
+            className="task-card",
+            style={
+                "flex": 1,
+                "background": "white",
+                "borderTopRightRadius": "12px",
+                "borderBottomRightRadius": "12px",
+                "padding": "16px",
+                "boxShadow": "0 2px 6px rgba(0,0,0,0.08)",
+                "display": "flex",
+                "flexDirection": "column",
+                "gap": "12px",
+                "fontFamily": "sans-serif"
+            },
+            children=[
+                html.Div(
+                    style={"display": "flex", "justifyContent": "space-between", "alignItems": "center"},
+                    children=[
+                        html.H4("Generate a report", style={"margin": 0, "fontSize": "1.1rem", "fontWeight": "600"}),
+                        html.Div("⋯", style={"fontSize": "1.5rem", "color": "#999", "cursor": "pointer"})
+                    ]
+                ),
+                html.Div(
+                    style={
+                        "display": "inline-flex",
+                        "alignItems": "center",
+                        "backgroundColor": "#f0f4ff",
+                        "color": "#1a73e8",
+                        "fontWeight": "500",
+                        "padding": "4px 8px",
+                        "borderRadius": "6px",
+                        "fontSize": "0.9rem"
+                    },
+                    children=["📁", html.Span(" The Gordons family")]
+                ),
+                html.P(
+                    "Ensure the documents prepared for the client are fully examined, giving special emphasis to critical aspects and...",
+                    style={"color": "#666", "fontSize": "0.9rem", "margin": 0}
+                ),
+                html.Div(
+                    style={"display": "flex", "gap": "16px", "fontSize": "0.85rem", "color": "#444"},
+                    children=[
+                        html.Div(["📅", html.Span(" Created on May 24")], style={"display": "flex", "gap": "6px"}),
+                        html.Div(["⏰", html.Span(" 12:30 - 14:00")], style={"display": "flex", "gap": "6px"})
+                    ]
+                ),
+                html.Div(
+                    style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "borderTop": "1px solid #eee", "paddingTop": "10px"},
+                    children=[
+                        html.Div(
+                            children=[
+                                html.Img(src="https://via.placeholder.com/24", style={
+                                    "width": "24px",
+                                    "height": "24px",
+                                    "borderRadius": "50%",
+                                    "objectFit": "cover",
+                                    "border": "2px solid white",
+                                    "boxShadow": "0 0 0 1px #ccc",
+                                    "marginRight": "4px"
+                                }),
+                                html.Img(src="https://via.placeholder.com/24", style={
+                                    "width": "24px",
+                                    "height": "24px",
+                                    "borderRadius": "50%",
+                                    "objectFit": "cover",
+                                    "border": "2px solid white",
+                                    "boxShadow": "0 0 0 1px #ccc"
+                                }),
+                            ],
+                            style={"display": "flex"}
+                        ),
+                        html.Div(
+                            children=[
+                                html.Div(["⚡", html.Span(" 15")], style={"display": "flex", "gap": "4px"}),
+                                html.Div(["💬", html.Span(" 19")], style={"display": "flex", "gap": "4px"})
+                            ],
+                            style={"display": "flex", "gap": "16px", "fontSize": "0.85rem", "color": "#666"}
+                        )
+                    ]
+                )
+            ]
+        )
+    ]
+)
