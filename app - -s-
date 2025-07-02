@@ -1,0 +1,3785 @@
+import dataiku
+import dash
+from dataiku import recipe
+from dash import Input, Output, State, dcc, html, callback_context, clientside_callback, ctx, dash_table, no_update, MATCH, ALL
+from dash.exceptions import PreventUpdate
+import dash_bootstrap_components as dbc
+import dash_ag_grid as dag
+import plotly.graph_objects as go
+import datetime as dt
+import pandas as pd
+import numpy as np
+import logging
+from flask import request
+import plotly.express as px
+import matplotlib.pyplot as plt
+import base64
+import math
+import uuid
+from dateutil.relativedelta import relativedelta
+from collections import defaultdict
+import dash_mantine_components as dmc
+import json
+import colorsys
+import hashlib
+import dash_daq as daq
+
+app.config.external_stylesheets = [
+    dbc.themes.FLATLY,
+    dbc.icons.BOOTSTRAP,
+    'https://fonts.googleapis.com/css2?family=IBM+Plex+Serif:ital,wght@0,100;0,200;0,300;0,400;0,500;0,600;0,700;1,100;1,200;1,300;1,400;1,500;1,600;1,700&family=Roboto:ital,wght@0,100;0,300;0,400;0,500;0,700;0,900;1,100;1,300;1,400;1,500;1,700;1,900&display=swap']
+
+app.config.suppress_callback_exceptions = True
+client = dataiku.api_client()
+project = client.get_project("CXC")
+scenario = project.get_scenario("COMMIT_CHANGES")
+edits_scenario = project.get_scenario("ADD_NEW_CHANGES")
+roles_scenario = project.get_scenario("ADD_NEW_ROLES")
+areas_scenario = project.get_scenario("ADD_NEW_AREAS")
+
+#-----------------------------------------------------------------------------
+# Triggering ad-hoc data pulls, on app creation:
+#          - Through Dataiku's API
+#          - Forcing new data to be read through callback functions
+#-----------------------------------------------------------------------------
+def projects_data_call():
+    projects_dataset = dataiku.Dataset("PROJECTS")
+    projects_df = projects_dataset.get_dataframe()
+    return projects_df
+def users_data_call():
+    users_dataset = dataiku.Dataset("USER_LEVELS_VAW")
+    users_df = users_dataset.get_dataframe()
+    return users_df
+def areas_data_call():
+    areas_dataset = dataiku.Dataset("AREAS")
+    areas_df = areas_dataset.get_dataframe()
+    return areas_df
+def roles_data_call():
+    roles_dataset = dataiku.Dataset("PROJECTS_USERS")
+    roles_df = roles_dataset.get_dataframe()
+    return roles_df
+    
+# Propagating fresh databases to master script
+projects_df = projects_data_call()
+users_df = users_data_call()
+areas_df = areas_data_call()
+roles_df = roles_data_call()
+
+admin_users = [
+    #'GONZJ243',
+    'Z9KWBISH',
+    'PHILLJ48',
+    'GARCIB06',
+    'CONNEJ10',
+    'MERINM02',
+    'WATSOS05'
+]
+
+FILTER_PROJECT_OPTIONS = {
+    "all":"All Projects",
+    "mine":"My Projects",
+    "team":"Team Projects"
+}
+
+@app.callback(
+    Output('user-output-store','data'),
+    Input('dummy','children')
+)
+
+def get_logged_user(_):
+    request_headers=dict(request.headers)
+    auth_info_browser=client.get_auth_info_from_browser_headers(request_headers)
+    logging.info((auth_info_browser))
+    logged_user = auth_info_browser["authIdentifier"]
+    return logged_user
+
+@app.callback(
+    Output("filtered-data-store","data"),
+    Input("dummy","children")
+)
+def preprocess_data(_):
+    request_headers=dict(request.headers)
+    auth_info_browser=client.get_auth_info_from_browser_headers(request_headers)
+    logging.info((auth_info_browser))
+    logged_user = auth_info_browser["authIdentifier"]
+    logged_user = logged_user.upper()
+    
+    if logged_user in admin_users:
+        user_level = 100
+    else:
+        user_level = users_df.loc[users_df["LAN_ID"] == logged_user,"LEVEL"].values[0]
+        
+    projects_df["LEVEL"] = pd.to_numeric(
+        projects_df["TIER"].str.extract(r'T(\d+)')[0],
+        errors='coerce'
+    )
+    eligible_by_level = projects_df[projects_df["LEVEL"] <= user_level]["ID"]
+    eligible_by_user = roles_df[roles_df["LAN_ID"] == logged_user]["PROJECT_ID"]
+    
+    eligible = pd.concat([eligible_by_level, eligible_by_user]).drop_duplicates()
+    filtered_projects_df = projects_df[projects_df["ID"].isin(eligible)]
+    return filtered_projects_df.to_dict('records')
+
+projects_df['ACTUAL_START_DATE_FMT'] = projects_df['ACTUAL_START_DATE'].dt.strftime('%d-%b-%y')
+projects_df['ACTUAL_END_DATE_FMT'] = projects_df['ACTUAL_END_DATE'].dt.strftime('%d-%b-%y')
+projects_df['PLANNED_START_DATE_FMT'] = projects_df['PLANNED_START_DATE'].dt.strftime('%d-%b-%y')
+projects_df['PLANNED_END_DATE_FMT'] = projects_df['PLANNED_END_DATE'].dt.strftime('%d-%b-%y')
+
+
+def month_diff(start, end):
+    if pd.isnull(start) or pd.isnull(end):
+        return None
+    delta = relativedelta(end, start)
+    return delta.years * 12 + delta.months
+
+projects_df['MONTHS_DIFF'] = projects_df.apply(
+    lambda row: month_diff(row['ACTUAL_START_DATE'], row['ACTUAL_END_DATE']), axis = 1)
+
+users_df["FIRST_PART"] = users_df["FIRST_NAME"].str.split().str[0]
+users_df["FULL_NAME"] = users_df["FIRST_PART"].str.title() + " " + users_df["LAST_NAME"].str.title()
+users_df["INITIAL_FIRST"] = users_df["FIRST_PART"].str[0]
+users_df["INITIAL_LAST"] = users_df["LAST_NAME"].str[0]
+users_df["INITIALS"] =  users_df["INITIAL_FIRST"] + users_df["INITIAL_LAST"]
+user_roles_df = pd.merge(roles_df, users_df, on='LAN_ID', how='left')
+
+unique_users = [
+    {"label": row['FULL_NAME'], 'value': row['LAN_ID']} for _, row in users_df.iterrows()]
+
+ROLES_ORDER_PRIORITY = {"Air Traffic Controller":0,"Pilot in Command":1,"Crew Member":2,"Subject Matter Expert":3}
+
+def create_enriched_projects_df():
+    user_role_summary = (
+        user_roles_df
+        .groupby(['PROJECT_ID', 'ROLE'])['FULL_NAME']
+        .apply(lambda x: ', '.join(sorted(x.dropna().astype(str))))
+        .unstack(fill_value='')
+        .reset_index()
+    )
+    
+    areas_role_summary = (
+        areas_df
+        .groupby(['PROJECT_ID'])['AREA_DESC']
+        .apply(lambda x: ', '.join(sorted(x.dropna().astype(str))))
+        .reset_index()
+    )
+    
+    projects_df['PROJECT_ID'] = projects_df['ID']
+    enriched_df = pd.merge(projects_df, user_role_summary, on='PROJECT_ID', how='left')
+    enriched_df = pd.merge(enriched_df, areas_role_summary, on = 'PROJECT_ID', how='left')
+    enriched_df['NUMBER_OF_AREAS'] = enriched_df['AREA_DESC'].str.count(",") + 1
+    return enriched_df
+
+initial_df = create_enriched_projects_df()
+projects_df['IS_DIGITAL'] = projects_df['DIGITAL_TEAM'].notna() & (projects_df['DIGITAL_TEAM'] != '')
+projects_df['START_DATE_DATETIME'] = pd.to_datetime(projects_df['ACTUAL_START_DATE'])
+projects_df['END_DATE_DATETIME'] = pd.to_datetime(projects_df['ACTUAL_END_DATE'])
+overview_df = projects_df['DIMENSION'].value_counts().reset_index()
+overview_df.columns = ['DIMENSION','COUNT']
+
+df_monthly = projects_df[['START_DATE_DATETIME','END_DATE_DATETIME','BUDGET','RISK','IS_DIGITAL']].copy()
+start_month = df_monthly['START_DATE_DATETIME'].min()
+end_month = df_monthly['END_DATE_DATETIME'].max()
+df_monthly = df_monthly[df_monthly['START_DATE_DATETIME'] < start_month + pd.DateOffset(months=24)]
+df_monthly['END_MONTH'] = pd.to_datetime(projects_df['START_DATE_DATETIME']).dt.date
+df_monthly['START_MONTH'] = pd.to_datetime(projects_df['END_DATE_DATETIME']).dt.date
+projects_df['START_DATE'] = pd.to_datetime(projects_df['ACTUAL_START_DATE']).dt.date
+projects_df['END_DATE'] = pd.to_datetime(projects_df['ACTUAL_END_DATE']).dt.date
+
+timeline_start = dt.datetime(2022,1,1)
+timeline_end = dt.datetime(2028,12,1)
+timeline_days = (timeline_end - timeline_start).days
+today_for_gantt = dt.datetime.today()
+
+
+def date_to_percent(raw_date):
+    if pd.isnull(raw_date):
+        raw_date = dt.datetime.today()
+    if not isinstance(raw_date, dt.datetime):
+        try:
+            raw_date = pd.to_datetime(raw_date)
+        except Exception as e:
+            raise ValueError(f"Invalid date format: {raw_date} -> {e}")
+        
+    days_from_start = (raw_date - timeline_start).days
+    return round((days_from_start / timeline_days)*100,2)
+today_position = date_to_percent(today_for_gantt)
+
+
+def make_timeline_bar(task):
+    raw_date = task['ACTUAL_START_DATE']
+    raw_end_date = task['ACTUAL_END_DATE']
+    
+    
+    if pd.isnull(task['ACTUAL_START_DATE']):
+        raw_date = dt.datetime.today()
+    if not isinstance(task['ACTUAL_START_DATE'], dt.datetime):
+        try:
+            raw_date = pd.to_datetime(task['ACTUAL_START_DATE'])
+        except Exception as e:
+            raise ValueError(f"Invalid date format: {task['ACTUAL_START_DATE']} -> {e}")
+    
+    if pd.isnull(task['ACTUAL_END_DATE']):
+        raw_end_date = dt.datetime.today()
+    if not isinstance(task['ACTUAL_END_DATE'], dt.datetime):
+        try:
+            raw_end_date = pd.to_datetime(task['ACTUAL_END_DATE'])
+        except Exception as e:
+            raise ValueError(f"Invalid date format: {task['ACTUAL_END_DATE']} -> {e}")
+            
+    left = date_to_percent(raw_date)
+    width = date_to_percent(raw_end_date) - left
+    
+    return html.Div([
+        html.Div(
+            
+            id=f"hover-target-{task}",
+            children=
+            [
+                html.P(task['NAME'], style={'fontSize':'11px',"vertical-align":"middle","margin":"0","padding":"0","whitespace":"nowrap","overflow":"hidden"}),
+                dbc.Tooltip([
+                    task['NAME'],
+                    html.Br(),
+                    html.Small("Due Date: "),
+                    task['ACTUAL_END_DATE_FMT'],
+                ],
+                    target=f"hover-target-{task}",
+                    placement="top",
+                    style={"fontSize":"0.9rem"}
+                )
+            ], style={
+                "backgroundColor":{
+                    "On Track":"#4DCC3F",
+                    "Off Track":"#FF6969"
+                }.get(task["RISK"],"#eee"),
+                "color":"#292929",
+                "borderRadius":"999px",
+                "padding":"6px 16px",
+                "fontWeight":"600",
+                "fontSize":"0.9rem",
+                "display":"inline-block",
+                "textAlign":"left",
+                'position':'absolute',
+                'left': f'{left}%',
+                'width': f'{width}%',
+                "textOverflow":"ellipsis",
+                "vertical-align":"middle",
+                "whitespace":"nowrap",
+                "overflow":"hidden",
+                "height":"30px",
+                "lineHeight":"24px"
+        })
+    ], style={'position':'relative','height':'10px','padding':'2px','minHeight':'14px','lineHeight':'1.05'})
+
+
+def compute_relevance_score(row):
+    if pd.notna(row.get("PRINCIPLE")) and pd.notna(row.get("INITIATIVE")):
+        return 3
+    elif pd.notna(row.get("PRINCIPLE")) or pd.notna(row.get("INITIATIVE")):
+        return 2
+    else:
+        return 1
+    
+def compute_tier_score(row):
+    if row.get("TIER") == 'T4':
+        return 3
+    elif row.get("TIER") == 'T3':
+        return 2
+    elif row.get("TIER") == 'T2':
+        return 1
+    else:
+        return 0
+    
+def compute_expedition_score(row):
+    if row.get("IS_EXPEDITED"):
+        return 2
+    else:
+        return 0
+    
+def compute_budget_score(row):
+    if row.get("BUDGET") > 3000000:
+        return 3
+    elif row.get("BUDGET") > 500000:
+        return 2
+    else:
+        return 1
+    
+def compute_timeline_score(row):
+    if row.get("MONTHS_DIFF") > 11:
+        return 2
+    elif row.get("MONTHS_DIFF") > 5:
+        return 0.5
+    else:
+        return 0
+    
+def compute_collaboration_score(row):
+    if pd.notna(row.get("DIGITAL_TEAM")):
+        return 1
+    else:
+        return 0    
+    
+projects_df['RELEVANCE_SCORE'] = projects_df.apply(compute_relevance_score, axis=1)
+projects_df['TIER_SCORE'] = projects_df.apply(compute_tier_score, axis=1)
+projects_df['EXPEDITED_SCORE'] = projects_df.apply(compute_expedition_score, axis=1)
+projects_df['BUDGET_SCORE'] = projects_df.apply(compute_budget_score, axis=1)
+projects_df['TIMELINE_SCORE'] = projects_df.apply(compute_timeline_score, axis=1)
+projects_df['COLLABORATION_SCORE'] = projects_df.apply(compute_collaboration_score, axis=1)
+
+projects_df['TOTAL_SCORE'] = projects_df[['RELEVANCE_SCORE','TIER_SCORE','EXPEDITED_SCORE','BUDGET_SCORE','TIMELINE_SCORE','COLLABORATION_SCORE']].sum(axis=1)
+projects_df.sort_values(by='TOTAL_SCORE')
+
+current_date = dt.date.today()
+principles = [
+    'Trust is Everything',
+    'Science Will Win',
+    'Disruption Calls for Innovation',
+    'Time is Life',
+    'Execution Makes the Difference']
+
+principle_data = {
+    'Trust is Everything': {
+        "style":{"background-color":"#FF6609"},
+        "title":"Trust is Everything",
+        "count":"0"
+    },
+    
+    'Science Will Win': {
+       "style":{"background-color":"#0095ff"},
+        "title":"Science Will Win",
+        "count":"0" 
+    },
+    
+    'Disruption Calls for Innovation': {
+        "style":{"background-color":"#12b000"},
+        "title":"Disruption Calls for Innovation",
+        "count":"0"
+    },
+    
+    'Time is Life':{
+        "style":{"background-color":"#9369ff"},
+        "title":"Time is Life",
+        "count":"0"
+    },
+    
+    'Execution Makes the Difference':{
+        "style":{"background-color":"#00b7a5"},
+        "title":"Execution Makes the Difference",
+        "count":"0"
+    }
+}
+
+def create_card(title, count, color):
+    return html.Div([
+        html.Div(style={
+            'height':'6px',
+            'backgroundColor':color,
+            'borderTopLeftRadius':'10px',
+            'borderTopRightRadius':'10px'
+        }),
+        html.Div([
+            html.H4(title, style={
+                'fontSize':'18px',
+                'fontWeight':'600',
+                'margin':'10px 0 5px'
+            }),
+            html.P(f"{count} projects", style={
+                'fontSize':'16px',
+                'margin':'0',
+                'color':'#666'
+            })
+        ], style={'padding':'10px 15px'})
+    ], style={
+        'width':'18%',
+        'backgroundColor':'#fff',
+        'borderRadius':'10px',
+        'boxShadow':'0 4px 10px rgba(0,0,0,0.1)',
+        'margin':'10px',
+        'display':'inline-block',
+        'verticalAlign':'top'
+    })
+    
+
+card_style = {
+    "border-radius":"8px",
+    "padding":"15px",
+    "margin":"10px",
+    "box-shadow":"0px 2px 5px rgba(0,0,0,0.1)"
+}
+
+card_title = {
+    "margin-bottom":"5px",
+    "font-weight":"bold"
+}
+
+card_body = {
+    "font-size":"16px",
+    "color":"#333"
+}
+
+tiers = [
+    'T4',
+    'T3',
+    'T2']
+stages = [
+    'Initiation',
+    'Planning',
+    'Execution',
+    'Monitoring',
+    'Closure']
+statuses = [
+    'Not Started',
+    'In Progress',
+    'Closed']
+initiatives = [
+    'GSC AMER Sustainability/Net Zero 2040',
+    'People - Wellness, Safety, Growth & Equity Culture',
+    'NextGen T2-T3 Capabilties',
+    'NextGen T1 Planning',
+    'NextGen T1 Delivering',
+    'Top & Standard Service Transformation',
+    'EMAP Implementation',
+    'Market Model Elevation',
+    'Risk Management']
+risks = [
+    'On Track',
+    'Off Track',
+    ]
+scopes = [
+    'Global',
+    'Americas',
+    'North America',
+    'Latin America',
+    'Northern Latin America',
+    'Southern Latin America',
+    'Argentina',
+    'Bolivia',
+    'Brazil',
+    'Canada',
+    'Central America',
+    'Chile',
+    'Colombia',
+    'Ecuador',
+    'Mexico',
+    'Paraguay',
+    'Peru',
+    'United States',
+    'Uruguay',
+    'Venezuela']
+scope_to_region = {
+    'Global':'Global',
+    'AMER':'Americas',
+    'US':'North America',
+    'PE':'Latin America',
+    'CAC':'Latin America',
+    'ARG':'Latin America',
+    'BR':'Latin America',
+    'LATAM':'Latin America',
+    'MX':'Latin America',
+    'PAR':'Latin America',
+    'CH':'Latin America',
+    'COL': 'Latin America',
+    'COL/VZ':'Latin America',
+    'CA':'North America',}
+dimensions = [
+    'EHS',
+    'Quality',
+    'Supply',
+    'Financial',
+    'People']
+def make_dimension_card(dimension,count):
+    return dbc.Card(
+        dbc.Button([
+            html.Div(dimension, style={'fontWeight':'bold'}),
+            html.Div(f"{count} projects", style={'fontSize':'12px','color':'black'})
+        ],
+            id={'type':'dimension-btn','index':dimension},
+            color='black',
+            style={'width':'100%','height':'100%','textAlign':'left','padding':'10px'}
+        ),
+        style={
+            'width':'18%',
+            'margin':'10px',
+            'borderRadius':'10px',
+            'boxShadow':'0 2px 6px rgba(0,0,0,0.1)'
+        }
+    )
+
+
+blueprint_data = pd.DataFrame({
+    'principle': [
+        'Trust is Everything',
+        'Trust is Everything',
+        'Science Will Win',
+        'Science Will Win',
+        'Science Will Win',
+        'Science Will Win',
+        'Science Will Win',
+        'Disruption Calls for Innovation',
+        'Disruption Calls for Innovation',
+        'Time is Life',
+        'Execution Makes the Difference',
+        'Execution Makes the Difference',
+        'Execution Makes the Difference'
+    ],
+    
+    'initiative': [
+        'GSC AMER Sustainability / Net Zero 2040',
+        'People - Wellness, Safety, GRowth & Equity Culture',
+        'Next Gen T2-T3 Capabilities: Planning Data',
+        'Next Gen T2-T3 Capabilities: Continuous Improvement',
+        'Next Gen T2-T3 Capabilities: Process Mapping',
+        'Next Gen T2-T3 Capabilities: Predictive Analytics',
+        'Next Gen T2-T3 Capabilities: Self-healing Data',
+        'NextGen T1 Planning',
+        'NextGen T1 Delivery',
+        'Top & Standard Service Transformation',
+        'EMAP Implementation',
+        'Market Model Elevation',
+        'Risk Management'
+    ],
+    'owner':[
+        'JUAREG03',
+        'PASARD01',
+        'MEDINR10',
+        'CONNEJ10',
+        'WATSOS05',
+        'Z9KWBISH',
+        'WATSOS05',
+        'CETAND',
+        'WATSOS05',
+        'MEDINR10',
+        'GARCIB06',
+        'WATSOS05',
+        'MCGINC03'
+    ]})
+blueprint_initiatives_map = blueprint_data.groupby("principle")["initiative"].unique().to_dict()
+user_options = [{"label":label,"value":value} for label, value in zip(users_df["FULL_NAME"], users_df["LAN_ID"])]
+
+areas_options = [{"label":label,"value":value} for label, value in zip(areas_df["AREA_DESC"], areas_df["AREA_DESC"])]
+
+colors = {
+    "Not Started - No Risk" : "#A8E39B",
+    "Not Started - Minor Risk" : "#F3B51A",
+    "Not Started - Major Risk" : "#C82435",
+    "In Progress - No Risk":"#55B348",
+    "In Progress - Minor Risk":"#FFD66F",
+    "In Progress - Major Risk":"#F03844",
+    "Closed - No Risk":"#0D310F",
+    "Closed - Minor Risk":"#FFD66F",
+    "Closed - Major Risk":"#FFC3BF"}
+booleans = ['True','False']
+
+dd_values = [
+    'TEAM',
+    'TIER',
+    'IS_EXPEDITED',
+    'SCOPE',
+    'IS_DIGITAL',
+    'DIGITAL_TEAM',
+    'PRIORITY',
+    'INITIATIVE',
+    'PRINCIPLE',
+    'IS_EXTENDED',
+    'STATUS',
+    'RISK',
+    'PROJECT_DIMENSION',
+    'IS_NEXTGEN']
+dd_labels = [
+    'Team',
+    'Tier',
+    'Expedited?',
+    'Scope',
+    'Digital?',
+    'Digital Team',
+    'Priority',
+    'Initiative',
+    'Principle',
+    'Extended',
+    'Status',
+    'Risk',
+    'Dimension',
+    'NextGen']
+dd_options = [
+    {'label':label, 'value':value} for label, value in zip(dd_labels,dd_values)]
+
+roles_options = ['Air Traffic Controller','Pilot in Command','Crew Member','Subject Matter Expert']
+
+def create_role_block(role):
+    return dbc.Col([
+        dbc.Label(role),
+        html.Div(id={'type':'tag-container','role':role}, style={'display':'flex','flexWrap':'wrap','gap':'5px'}),
+        dbc.Input(
+            id={'type':'input-box','role':role},
+            placeholder=f"Add {role}",
+            type='text',
+            debounce=True,
+            style={'marginTop':'10px'}
+        ),
+        dcc.Store(id={'type':'store','role':role}, data=[]),
+        html.Hr()
+    ], width = 3)
+projects_df['REGION'] = projects_df['SCOPE'].map(scope_to_region)
+
+projects_pivot_df = projects_df.pivot_table(
+    index = ['REGION','SCOPE'],
+    columns='STATUS',
+    aggfunc='size',
+    fill_value=0).reset_index()
+region_summary = (
+    projects_df.groupby(['REGION','STATUS']).size()
+    .unstack(fill_value=0)
+    .reset_index())
+country_summary = (
+    projects_df.groupby(['REGION','SCOPE','STATUS']).size()
+    .unstack(fill_value=0)
+    .reset_index())
+
+region_columns = [{"headerName":"Region", "field":"REGION"}] + [
+    {"headerName":status, "field":status} for status in region_summary.columns if status != "REGION"]
+
+country_columns = [
+    {"headerName": "Scope", "field":"SCOPE"},] + [{"headerName": status, "field": status} for status in country_summary.columns if status not in ["REGION","SCOPE"]]
+
+def uid_to_color(uid):
+    hash_digest = hashlib.md5(uid.encode()).hexdigest()
+    hue = int(hash_digest[:2],16) / 255.0
+    r,g,b = colorsys.hsv_to_rgb(hue, 0.5, 0.85)
+    return f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}"
+
+def render_avatars(project_id):
+    user_ids = user_roles_df[user_roles_df.PROJECT_ID == project_id].LAN_ID.tolist()
+    user_data = user_roles_df[(user_roles_df['LAN_ID'].isin(user_ids)) & (user_roles_df['PROJECT_ID'] == project_id)].copy()
+    
+    user_data["priority"] = user_data["ROLE"].map(ROLES_ORDER_PRIORITY)
+    user_data = user_data.sort_values(by="priority")
+    
+    max_visible = 3
+    avatars = []
+    
+    for _, row in user_data.iloc[:max_visible].iterrows():
+        uid = row["LAN_ID"]
+        name = str(row["FULL_NAME"])
+        role = row["ROLE"]
+        initials = "".join([x[0] for x in name.split()[:2]]).upper()
+        color = uid_to_color(uid)
+        title_text = f"{name} - {role}"
+        
+        avatars.append(
+            html.Div([
+                html.Div(initials, title=title_text,style={
+                    "display":"flex",
+                    "alignItems":"center",
+                    "justifyContent":"center",
+                    "width":"28px",
+                    "height":"28px",
+                    "borderRadius":"14px",
+                    "backgroundColor":color,
+                    "color":"white",
+                    "fontSize":"12px",
+                    "position":"relative"
+                }),
+                html.Div(role[0].upper(),style={
+                    "position":"absolute",
+                    "bottom":"-4px",
+                    "right":"-4px",
+                    "backgroundColor":"white",
+                    "color":"#444",
+                    "border":"1px solid #ccc",
+                    "borderRadius":"6px",
+                    "fontSize":"8px",
+                    "width":"12px",
+                    "height":"12px",
+                    "display":"flex",
+                    "alignItems":"center",
+                    "justifyContent":"center",
+                    "boxShadow":"0px 1px 2px rgba(0,0,0,0.1)"
+                })
+            ], style={"position":"relative","marginRight":"6px"})   
+        )
+        
+    if len(user_data) > max_visible:
+        extra_data = user_data.iloc[max_visible:]
+        extra_names = [f"{r['FULL_NAME']} ({r['ROLE']})" for _, r in extra_data.iterrows()]
+        avatars.append(
+            html.Div(f"+{len(extra_data)}", title=", ".join(extra_names), style={
+                "display":"inline-flex",
+                "alignItems":"center",
+                "justifyContent":"center",
+                "width":"28px",
+                "height":"28px",
+                "borderRadius":"14px",
+                "backgroundColor":"#999",
+                "color":"white",
+                "fontSize":"12px",
+                "marginRight":"6px",
+                "boxShadow":"0px 1px 4px rgba(0,0,0,0.1)",
+                "cursor":"default"
+            })
+        )
+    return avatars
+
+
+#-----------------------------------------------------------------------------
+# Building style sheets
+#-----------------------------------------------------------------------------
+grid_row_style = {
+    'fontFamily':"'Inter', sans-serif",
+    'font-size':'10px',
+    'font-style':'normal',
+    'color':'#00003A',
+    'height':'30vh'}
+grid_row_style2 = {
+    'font-family':'Roboto',
+    'font-size':'clamp(10px, 1vh, 12px)',
+    'font-style':'normal',
+    'color':'#00003A',
+    'height':'30vh'}
+grid_style = {
+    'fontFamily':"'Inter', sans-serif",
+    'font-size':'10px',
+    'font-style':'normal',
+    'color':'#00003A',
+    'height':'80vh'}
+minimal_grid_style = {
+    'fontFamily':"'Inter', sans-serif",
+    'font-size':'11px',
+    'font-style':'normal',
+    'color':'#00003A'}
+grid_style2 = {
+    'fontFamily':"'Inter', sans-serif",
+    'font-size':'10px',
+    'font-style':'normal',
+    'color':'#00003A',
+    'height':'clamp(30vh, 35vh, 40vh)'}
+trust_style = {
+    'background-color':'#FF6600',
+    'color':'#FFFFFF'}
+science_style = {
+    'background-color':'#0095FF',
+    'color':'#FFFFFF'}
+innovation_style = {
+    'background-color':'#12B000',
+    'color':'#FFFFFF'}
+time_style = {
+    'background-color':'#9369FF',
+    'color':'#FFFFFF'}
+execution_style = {
+    'background-color':'#00B7A5',
+    'color':'#FFFFFF'}
+default_style = {
+    'background-color': '#FFFFFF'}
+major_style = {
+    'background-color':'#F03844',
+    'color':'#000000'}
+minor_style = {
+    'background-color':'#ffd66f',
+    'color':'#000000'}
+ok_style = {
+    'background-color':'#55B348',
+    'color':'#000000'}
+card_title = {
+    'margin-bottom':'5px',
+    'margin-top':'5px',
+    'font-weight':'medium',
+    'font-size':'12px',
+    'font-family':'Roboto'}
+card_height = {
+    'margin-bottom':'5px',
+    'margin-top':'5px',
+    'font-weight':'medium',
+    'font-size':'12px',
+    'font-family':'Roboto',
+    'text-wrap': 'wrap',
+    'white-space': 'normal'}
+card_body = {
+    'font-size': '30px',
+    'font-weight':'bold',
+    'margin':'0px',
+    'font-family':'Roboto'}
+trust_font = {'color':'#FF6600'}
+science_font = {'color':'#0095FF'}
+innovation_font = {'color':'#12B000'}
+time_font = {'color':'#9369FF'}
+execution_font = {'color':'#00B7A5'}
+
+toggle_button_style = {
+    'background':'none',
+    'border':'none',
+    'color': 'white',
+    'fontSize':'24px',
+    'cursor':'pointer',
+    'width':'100%',
+    'textAlign':'left',
+    'padding':'10px'}
+sidebar_style = {
+    'width':'120px',
+    'backgroundColor':'#1e1e2f',
+    'color':'white',
+    'height':'100vh',
+    'paddingTop':'20px',
+    'transition':'width 0.3s',
+    'overflow':'hidden',
+    'position':'fixed'}
+main_style = {
+    'transition':'margin-left 0.3s',
+    'padding':'20px',
+    'width':'100%'}
+collapse_button_style = {
+    'background-color':'white',
+    'color':'#0000C9',
+    'border':'solid',
+    'border-width': 'thin',
+    'border-color':'#0000C9',
+    'border-radius':'20px',
+    'padding':'5px 10px',
+    'display':'flex',
+    'align-items':'center',
+    'justify-content':'space-between',
+    'width':'90%',
+    'font-size':'clamp(10px,2vh,12px)',
+    'font-weight':'bold',
+    'cursor':'pointer'}
+
+navbar_button_style = {
+    'background-color':'white',
+    'color':'#0000C9',
+    'border':'solid',
+    'border-width': 'thin',
+    'border-color':'#0000C9',
+    'border-radius':'20px',
+    'padding':'5px 10px',
+    'display':'flex',
+    'align-items':'center',
+    'justify-content':'space-between',
+    'width':'100%',
+    'font-size':'clamp(10px,2vh,12px)',
+    'font-weight':'bold',
+    'cursor':'pointer',
+    'margin':'10px'}
+
+collapse_button_main = {
+    'background-color':'#0000c9',
+    'color':'white',
+    'border':'solid',
+    'border-width': 'thin',
+    'border-color':'#00003A',
+    'border-radius':'20px',
+    'padding':'5px 10px',
+    'display':'flex',
+    'align-items':'center',
+    'justify-content':'space-between',
+    'width':'90%',
+    'font-size':'clamp(10px,2vh,12px)',
+    'font-weight':'bold',
+    'cursor':'pointer'}
+table_button_style = {
+    'background-color':'white',
+    'color':'#3D3D3D',
+    'border':'solid',
+    'border-width': 'thin',
+    'border-color':'#D3D3D3',
+    'display':'flex',
+    'align-items':'center',
+    'justify-content':'space-between',
+    'width':'100%',
+    'font-size':'10px',
+    'border-radius':'0px',
+    'cursor':'pointer'}
+collapse_span_style = {
+    'font-size':'clamp(10px,2vh,12px)',
+    'margin-left':'5px'}
+header_style = {
+    'font-family':'Roboto',
+    'font-weight': '1vh',
+    'font-size':'clamp(12px, 2vh, 16px)',
+    'font-style':'medium',
+    'color':'#0000C9'}
+navbar_style = {
+    'height': '50px',
+    'background-color':'white',
+    'width': '80vw',
+    'padding':'2px 5px 5px 2px',
+    'margin-top': '0px',
+    'margin-bottom': '10px',
+    'margin-right': '0px',
+    'margin-left': '0px'}
+img_style = {
+    'object-fit':'contain',
+    'width': '50%',
+    'height': '50%'}
+chart_card_style = {
+    'height':'200px',
+    'width':'45%',
+    'border-style':'solid',
+    'border-color':'lightgray',
+    'border-width':'thin',
+    'margin':'10px',
+    'border-radius':'8px'}
+sidebar_link = {
+    'display':'block',
+    'color':'#f2f2f2',
+    'padding':'10px 5px',
+    'text-decoration':'none',
+    'text-color':'white'}
+sidebar = {
+    'position':'fixed',
+    'left':'0',
+    'top':'0',
+    'bottom':'0',
+    'width':'100px',
+    'background-color':'#111',
+    'padding':'20px 10px',
+    'color':'white'}
+principle_colors_badge = {
+    'Trust is Everything':'#FF6600',
+    'Science Will Win':'#0095FF',
+    'Disruption Calls for Innovation':'#12B000',
+    'Time is Life':'#9369FF',
+    'Execution Makes the Difference':'#00B7A5',}
+form_label_style = {
+    'text-color':'#141313',
+    'font-size':'11px',
+    'font-weight':'medium'}
+form_element_style = {
+    'text-color':'#141313',
+    'font-size':'11px',
+    'font-weight':'medium'}
+datepicker_style = {
+    'border-radius': '4px 0 0 4px !important',
+    'height': '34px !important',
+    'width': '100% !important',
+    'border': '1px solid #ccc !important',}
+sidebar_button_style = {"width": "100%","margin":"5px"}
+
+status_fig = px.pie(projects_df, values='ID', names='STATUS', title='Projects by Status', hole = 0.3)
+status_fig.update_layout(margin=dict(t=45, b=10, l=0, r=0))
+tier_fig = px.pie(projects_df, values='ID', names='TIER', title='Projects by Tier', hole = 0.3)
+tier_fig.update_layout(margin=dict(t=45, b=10, l=0, r=0))
+team_fig = px.pie(projects_df, values='ID', names='TEAM', title='Projects by Team', hole = 0.3)
+team_fig.update_layout(margin=dict(t=45, b=10, l=0, r=0))
+risk_fig = px.pie(projects_df, values='ID', names='RISK', title='Projects by Risk', hole = 0.3)
+risk_fig.update_layout(margin=dict(t=45,b=10,l=0, r=0))
+
+df_budget = df_monthly.groupby(['START_MONTH','IS_DIGITAL'], as_index = False)['BUDGET'].sum()
+df_budget = df_budget[df_budget['IS_DIGITAL']]
+df_budget["BUDGET"] = round(df_budget['BUDGET']/1000, 0)
+budget_fig = px.bar(df_budget, x='START_MONTH',y='BUDGET',color='IS_DIGITAL',
+                    title='Budget Allocation by Month',
+                    text=[f'${i}k' for i in df_budget['BUDGET']],
+                    barmode='relative'
+                   )
+budget_fig.update_layout(xaxis_type='category')
+
+def completion_percentage(stage):
+    if stage == 'Initiation':
+        return 0.10
+    if stage == 'Planning':
+        return 0.25
+    if stage == 'Execution':
+        return 0.40
+    if stage == 'Monitoring':
+        return 0.85
+    if stage == 'Closure':
+        return 1.00
+    return 0
+
+projects_df['START_DATE_DATE'] = pd.to_datetime(projects_df['START_DATE'])
+projects_df['END_DATE_DATE'] = pd.to_datetime(projects_df['END_DATE'])
+projects_df['COMPLETION_PERC'] = projects_df['STAGE'].apply(completion_percentage)
+projects_df['DAYS_TO_START'] = (projects_df['START_DATE_DATE'] - projects_df['END_DATE_DATE'].min()).dt.days
+projects_df['DAYS_TO_END'] = (projects_df['END_DATE_DATE'] - projects_df['START_DATE_DATE'].min()).dt.days
+projects_df['TASK_DURATION'] = projects_df['DAYS_TO_END'] - projects_df['DAYS_TO_START'] + 1
+projects_df['COMPLETION_DAYS'] = projects_df['COMPLETION_PERC'] * projects_df['TASK_DURATION']
+projects_df['COLOR_LABEL'] = projects_df['PRINCIPLE'] + " - " + projects_df['INITIATIVE']
+projects_df['START_CALC'] = projects_df['END_DATE_DATE'] - dt.timedelta(days=10)
+
+projects_df.sort_values('ACTUAL_START_DATE', inplace=True)
+
+df_roadmap = projects_df.copy()
+df_roadmap = df_roadmap.sort_values(by=['ACTUAL_END_DATE'])
+df_roadmap["END_MONTH"] = df_roadmap['ACTUAL_END_DATE'].astype(str).str[:7]+'-01'
+df_roadmap["END_DATE_STR"] = df_roadmap["ACTUAL_END_DATE"].astype(str)
+df_roadmap["YEAR"] = df_roadmap['END_DATE_STR'].str[:4]
+df_roadmap["QUARTER"] = ((df_roadmap['END_MONTH'].str[5:7].astype(int) - 1) // 3 + 1).astype(str)
+df_roadmap["END_QUARTER"] = df_roadmap["YEAR"]+ '-Q'+ df_roadmap['QUARTER']
+
+roadmap_chart = px.timeline(
+    projects_df,
+    x_start="START_CALC",
+    x_end="ACTUAL_END_DATE",
+    y="NAME",
+    color="COLOR_LABEL",
+    title="Roadmap",
+    color_discrete_map=colors)
+roadmap_chart.update_yaxes(categoryorder="total descending")
+roadmap_chart.update_layout(height=min(900,len(projects_df) * 30))
+roadmap_chart.update_xaxes(tickformat="%Y Q%q")
+df_roadmap["SCATTER_INDEX"] = df_roadmap.groupby("END_MONTH")["ID"].rank(method="dense").astype(int)
+
+roadmap_scatter = px.scatter(
+    df_roadmap,
+    x="END_MONTH",
+    y="SCATTER_INDEX",
+    color = "TEAM",
+    size=[10]*len(df_roadmap),
+    hover_data=["ID"],
+    custom_data = ['ID'],
+    text="ID",
+    title="Roadmap: based on estimated end dates")
+
+roadmap_scatter.update_layout(clickmode='event+select', legend=dict(orientation="h",yanchor="top",y=-0.2,xanchor="left",x=0), xaxis_title=None)
+roadmap_scatter.update_traces(marker=dict(size=10,line=dict(width=5,color='#FFFFFF')),selector=dict(mode='markers'),textposition='center')
+roadmap_scatter.update_yaxes(visible=False)
+roadmap_scatter.update_xaxes(dtick="M1",tickformat="%b\n%Y")
+
+principle_pie = px.pie(projects_df, values='ID', names='PRINCIPLE', title='Projects by Principle', hole = 0.3)
+principle_pie.update_layout(margin=dict(t=45, b=10, l=0, r=0))
+
+edit_panel_columns = [
+    {'field': 'ID','headerName':'ID','hide':True},
+    {'headerName': 'T4 Principle','field': 'PRINCIPLE','cellEditor': 'agSelectCellEditor','cellEditorParams': {'values': principles},
+        'cellStyle': {
+            "function": f'''
+                params.value === 'Trust is Everything' ? {trust_style}
+                : params.value === 'Science Will Win' ? {science_style}
+                : params.value === 'Disruption Calls for Innovation' ? {innovation_style}
+                : params.value === 'Time is Life' ? {time_style}
+                : params.value === 'Execution Makes the Difference' ? {execution_style}
+                : {default_style}
+            ''',
+            "flex":1
+        }
+    },
+    {'headerName': 'T4 Initiative','field': 'INITIATIVE','cellEditor': 'agSelectCellEditor','cellEditorParams': {'values': initiatives},'cellStyle':{"flex":1}},
+    {'headerName':'Dimension','field':'DIMENSION','cellEditor': 'agSelectCellEditor','cellEditorParams': {'values': dimensions},'style':{'text-align':'center'}},
+    {"field": "IS_NEXTGEN","headerName": "NextGen?",'cellDataType': 'boolean'},
+    {"field": "TEAM","headerName": "Team",'style':{'text-align':'center'}},
+    {"field": "TIER","headerName": "Tier",'cellEditor': 'agSelectCellEditor','cellEditorParams': {'values': tiers},'style':{'text-align':'center'}},
+    {"field": "SCOPE","headerName": "Scope",'style':{'text-align':'center'}},
+    {"field": "IS_EXPEDITED","headerName": "Expedited?",'cellDataType': 'boolean'},
+    {"field": "DIGITAL_TEAM","headerName": "Digital Team"},
+    {'headerName':'Budget','field':'BUDGET',"valueFormatter": {"function": "d3.format('$,.0f')(params.value)"}},
+    {'headerName': 'Start Date','field': 'ACTUAL_START_DATE_FMT','filter': 'agDateColumnFilter'},
+    {'headerName': 'Due Date','field': 'ACTUAL_END_DATE_FMT',"filter": "agDateColumnFilter"},
+    {'headerName': 'Status','field': 'STATUS','cellEditor': 'agSelectCellEditor','cellEditorParams': {'values': statuses},
+         'cellStyle': {
+            "function": f'''
+                    params.value === 'Not Started' ? {major_style}
+                    : params.value === 'In Progress' ? {ok_style}
+                    : params.value === 'Closed' ? {science_style}
+                    : {default_style}
+                '''
+        }
+    },
+    {'headerName': 'Stage','field': 'STAGE','cellEditor': 'agSelectCellEditor','cellEditorParams': {'values': stages}},
+    {'headerName': 'Risk','field': 'RISK','cellEditor': 'agSelectCellEditor','cellEditorParams': {'values': risks},
+         'cellStyle': {
+            "function": f'''
+                    params.value === 'Off Track' ? {major_style}
+                    : params.value === 'On Track' ? {ok_style}
+                    : {default_style}
+                '''
+        }
+    }
+]
+
+list_panel_columns = [
+    {'field': 'ID','headerName':'ID','hide':True},
+    {'field': 'NAME','headerName':'Name'},
+    {'field': 'DESCRIPTION','headerName':'Description'},
+    {'headerName': 'T4 Principle','field': 'PRINCIPLE','cellEditor': 'agSelectCellEditor','cellEditorParams': {'values': principles},
+        'cellStyle': {
+            "function": f'''
+                params.value === 'Trust is Everything' ? {trust_style}
+                : params.value === 'Science Will Win' ? {science_style}
+                : params.value === 'Disruption Calls for Innovation' ? {innovation_style}
+                : params.value === 'Time is Life' ? {time_style}
+                : params.value === 'Execution Makes the Difference' ? {execution_style}
+                : {default_style}
+            ''',
+            "flex":1
+        }
+    },
+    {'headerName': 'T4 Initiative','field': 'INITIATIVE','cellEditor': 'agSelectCellEditor','cellEditorParams': {'values': initiatives},'cellStyle':{"flex":1}},
+    {'headerName':'Dimension','field':'DIMENSION','cellEditor': 'agSelectCellEditor','cellEditorParams': {'values': dimensions},'style':{'text-align':'center'}},
+    {"field": "IS_NEXTGEN","headerName": "NextGen?",'cellDataType': 'boolean'},
+    {"field": "TEAM","headerName": "Team",'style':{'text-align':'center'}},
+    {"field": "TIER","headerName": "Tier",'cellEditor': 'agSelectCellEditor','cellEditorParams': {'values': tiers},'style':{'text-align':'center'}},
+    {"field": "SCOPE","headerName": "Scope",'style':{'text-align':'center'}},
+    {"field": "IS_EXPEDITED","headerName": "Expedited?",'cellDataType': 'boolean'},
+    {"field": "DIGITAL_TEAM","headerName": "Digital Team"},
+    {'headerName':'Budget','field':'BUDGET',"valueFormatter": {"function": "d3.format('$,.0f')(params.value)"}},
+    {'headerName': 'Start Date','field': 'ACTUAL_START_DATE_FMT','filter': 'agDateColumnFilter'},
+    {'headerName': 'Due Date','field': 'ACTUAL_END_DATE_FMT',"filter": "agDateColumnFilter"},
+    {'headerName': 'Status','field': 'STATUS','cellEditor': 'agSelectCellEditor','cellEditorParams': {'values': statuses},
+         'cellStyle': {
+            "function": f'''
+                    params.value === 'Not Started' ? {major_style}
+                    : params.value === 'In Progress' ? {ok_style}
+                    : params.value === 'Closed' ? {science_style}
+                    : {default_style}
+                '''
+        }
+    },
+    {'headerName': 'Stage','field': 'STAGE','cellEditor': 'agSelectCellEditor','cellEditorParams': {'values': stages}},
+    {'headerName': 'Risk','field': 'RISK','cellEditor': 'agSelectCellEditor','cellEditorParams': {'values': risks},
+         'cellStyle': {
+            "function": f'''
+                    params.value === 'Off Track' ? {major_style}
+                    : params.value === 'On Track' ? {ok_style}
+                    : {default_style}
+                '''
+        }
+    }
+]
+
+filters_btn_style = {
+    "text-align":"center",
+    "width":"80px",
+    "fontSize":"clamp(10px,0.7vw,13px)",
+    "whiteSpace":"wrap",
+    "overflow":"hidden",
+    "textAlign":"center",
+    "display":"block"
+}
+
+sidebar_btn_style = {
+    "marginBottom":"20px",
+    "backgroundColor":"#f4f6f8",
+    "color":"black",
+    "border":"none",
+    "text-align":"left",
+    "width":"90%",
+    "whiteSpace":"nowrap",
+    "overflow":"hidden",
+    "textAlign":"left",
+    "display":"block"
+}
+
+form_input_style = {
+    "width":"100%",
+    "padding":"10px 14px",
+    "border":"1px solid #ccc",
+    "borderRadius":"8px",
+    "fontSize":"14px",
+    "backgroundColor":"#ffffff",
+    "color":"#333"
+}
+
+label_style={
+    "fontWeight":"500",
+    "color":"#666",
+    "fontSize":"13px",
+    "marginBottom":"4px"
+}
+
+common_input = {
+    "width":"100%",
+    "padding":"10px 14px",
+    "border":"1px solid #ddd",
+    "borderRadius":"8px",
+    "fontSize":"14px"
+}
+
+sidebar = html.Div(style={
+    "position":"fixed",
+    "top":"0",
+    "left":"0",
+    "width":"170px",
+    "height":"100vh",
+    "backgroundColor":"#f4f6f8",
+    "padding":"10px",
+    "overflow-y":"auto",
+    "boxShadow":"2px 0 6px rgba(0,0,0,0.5)"
+    
+}, children = [
+    
+    html.H5("Menu", style={"marginBottom":"40px"}),
+    dbc.Button("🧬 Blueprint", id="sidebar-btn-blue", style=sidebar_btn_style),
+    dbc.Button("📇 Cards View", id="sidebar-btn-home", style=sidebar_btn_style),
+    dbc.Button("🧮 List", id="sidebar-btn-list", style=sidebar_btn_style),
+    dbc.Button("🔍 Dimensions", id="sidebar-btn-dims", style=sidebar_btn_style),
+    dbc.Button("⌚ Gantt", id="sidebar-btn-gant", style=sidebar_btn_style),
+    dbc.Button("🗺️ Roadmap", id="sidebar-btn-road", style=sidebar_btn_style),
+    dbc.Button("📃 Charter", id="sidebar-btn-char", disabled = True, style={"display":"none"}),
+])
+
+
+new_div = html.Div([
+    dcc.Store(id="current-step", data=1),
+            
+    html.Div([
+        html.H2("Create a new project", style={"marginBottom":"10px"}),
+        html.Div(id="progress-bar", style={
+            "height":"6px",
+            "borderRadius":"44px",
+            "backgroundColor":"#eee",
+            "overflow":"hidden",
+            "marginBottom":"20px"
+        })
+    ]),
+
+    html.Div(id="form-content", style={"display":"flex","flexDirection":"column","gap":"20px", "height":"100%"}),
+
+    html.Div([
+        dbc.Button("Back", id="btn-back",n_clicks=0, style={"display":"none"}),
+        dbc.Button("Next", id="btn-next", n_clicks=0),
+        dbc.Button("Submit",id="btn-submit", n_clicks=0, style={"display":"none"})
+    ], style={"marginTop":"30px","display":"flex","gap":"10px"})
+], style ={
+    "margin":"40px auto",
+    "padding":"30px",
+    "borderRadius":"12px",
+    "boxShadow":"0 4px 20px rgba(0,0,0,0.05)",
+    "backgroundColor":"#ffffff",
+    "fontFamily":"'Inter, sans-serif",
+    "display":"flex",
+    "flexDirection":"column"
+})
+
+current_date = dt.datetime.today()
+current_year = current_date.year
+sem_end = (
+    dt.date(current_year,6,30) if current_date < dt.datetime(current_year,6,30)
+    else dt.date(current_year,11,30) if current_date < dt.datetime(current_year,11,30)
+    else dt.date(current_year + 1, 6,30)
+)
+
+s1_end = dt.date(current_year,6,30)
+s2_end = dt.date(current_year,11,30)
+
+
+
+app.layout = html.Div(style={"fontFamily":"'Inter', sans-serif", "display":"flex","width":"100%"}, children=[
+    sidebar,
+    html.Div(style={"margin-left":"170px","flexGrow":1,"flex":"1","display":"flex","flex-direction":"column","padding":"30px","backgroundColor":"#f9fafa","width":"100%"}, children=[
+        html.Div(style={"display":"flex","width":"100%","padding":"10px 20px", "flex-wrap":"wrap","gap":"10px"}, children=[
+            html.Div([
+                html.H5("Project Visibility Tool",id="page-title-text"),
+                html.Div(id="filter-indicator-text")
+            ], style={"flex":"0 0 15%", "min-width":"12px"}),
+            html.Div([
+                dbc.ButtonGroup([
+                    dbc.Button("🗺️ Global", id="btn-glob",color="primary", outline=True, n_clicks=0, style=filters_btn_style),
+                    dbc.Button("🌎 Americas", id="btn-amer",color="primary", outline=True, n_clicks=0, style=filters_btn_style),
+                    dbc.Button("📍 NOAM", id="btn-noam",color="primary", outline=True, n_clicks=0, style=filters_btn_style),
+                    dbc.Button("📍 LATAM", id="btn-lata",color="primary", outline=True, n_clicks=0, style=filters_btn_style),
+                ], className="me-3"),
+                
+                dbc.ButtonGroup([
+                    dbc.Button("⚠️ Off Track", id="btn-off",color="primary", outline=True, n_clicks=0, style=filters_btn_style),
+                    dbc.Button("✔️ On Track", id="btn-on",color="primary", outline=True, n_clicks=0, style=filters_btn_style),
+                ], className="me-3"),
+                
+                dbc.ButtonGroup([
+                    dbc.Button("👤 My Projects", id="btn-mine",color="primary", outline=True, n_clicks=0, style=filters_btn_style),
+                    dbc.Button("🫂 Team Projects", id="btn-team",color="primary", outline=True, n_clicks=0, style=filters_btn_style),
+                ], className="me-3"),
+                
+                dbc.ButtonGroup([
+                    dbc.Button("💯 All Projects", id="btn-all",color="primary", outline=True, n_clicks=0, style=filters_btn_style),
+                ], className="me-3"),
+                
+                dbc.Button("➕ New Project", id="btn-new",color="info", n_clicks=0, style=filters_btn_style)
+
+            ], style={"flex":"1","display":"flex","justify-content":"flex-end","flex-wrap":"wrap","gap":"10px"}),
+        ]),
+        html.Div(id="main-content-div"),
+        
+        dbc.Offcanvas(
+            id="edit-panel",
+            children=[],
+            is_open=False,
+            placement="bottom",
+            className="shadow-md",
+            style={"height":"60%"}
+        ),
+        
+        dbc.Offcanvas(
+            id="assign-panel",
+            children=[],
+            is_open=False,
+            placement="bottom",
+            className="shadow-md",
+            style={"height":"60%"}
+        ),
+
+        
+        dbc.Offcanvas(
+            id="new-panel",
+            is_open = False,
+            placement="bottom",
+            scrollable=False,
+            title="New Project Creation",
+            style={
+                "height":"60%",
+                "width":"100%",
+                "padding":"0",
+                "backgroundColor":"#F9FAFB",
+                "borderTopLeftRadius":"16px",
+                "borderTopRightRadius":"16px",
+                "display":"flex",
+                "flexDirection":"column"
+            },
+            children=[
+                html.Div([
+                    dbc.Container([
+                        dbc.Form([
+                            dbc.Row([
+                                dbc.Col([
+                                    dbc.FormFloating([dbc.Input(id="new-proj-name",type="text", invalid=True),dbc.Label("Name")])
+                                ], md=6),
+                                dbc.Col([
+
+                                    #TODO"""""""""""""""
+                                    dbc.FormFloating([dbc.Select(id="new-proj-tier",options=tiers, invalid=True),dbc.Label("Tier")])
+                                ], md=3),
+                                dbc.Col([
+                                    dbc.Checkbox(id="new-proj-exp",className="form-check-input"),dbc.Label("Is Expedited?")
+                                ], md=3, className="d-flex align-items-center"),
+                            ], className="mb-3"),
+
+                            dbc.Row([
+                                dbc.Col([
+                                    dbc.FormFloating([dbc.Textarea(id="new-proj-desc"),dbc.Label("Description")])
+                                ], md=12)
+                            ], className="mb-3"),
+
+                            dbc.Row([
+                                dbc.Col([
+                                    dbc.FormFloating([dbc.Input(id="new-proj-team",type="text"),dbc.Label("Team")])
+                                ], md=3),
+
+                                dbc.Col([
+                                    dbc.FormFloating([dbc.Input(id="new-proj-dig_team",type="text"),dbc.Label("Digital Team")])
+                                ], md=3),
+
+                                dbc.Col([
+                                    dbc.FormFloating([dbc.Select(id="new-proj-scope",options=scopes),dbc.Label("Scope")])
+                                ], md=3),
+
+                                dbc.Col([
+                                    dbc.FormFloating([dbc.Select(id="new-proj-dim",options=dimensions, invalid=True),dbc.Label("Dimension")])
+                                ], md=3),
+                            ], className="mb-3"),
+
+                            dbc.Row([
+                                dbc.Col([
+                                    dbc.FormFloating([dbc.Select(id="new-proj-prin",options=principles, invalid=True),dbc.Label("Principle")])
+                                ], md=3),
+                                dbc.Col([
+                                    dbc.FormFloating([dbc.Select(id="new-proj-init",options=initiatives, invalid=True),dbc.Label("Initiative")])
+                                ], md=3),
+                                dbc.Col([
+                                    dbc.FormFloating([dbc.Select(id="new-proj-status",options=statuses, invalid=True),dbc.Label("Status")])
+                                ], md=3),
+                                dbc.Col([
+                                    dbc.FormFloating([dbc.Select(id="new-proj-stage",options=stages, invalid=True),dbc.Label("Stage")])
+                                ], md=3)
+
+                            ], className="mb-3"),
+
+                            dbc.Row([
+                                dbc.Col([
+                                    dbc.Checkbox(id="new-proj-nextgen",className="form-check-input"),dbc.Label("Is NextGen?")
+                                ], md=3, className="d-flex align-items-center"),
+
+                                dbc.Col([
+                                    dbc.FormFloating([dbc.Select(id="new-proj-risk",options=risks, invalid=True),dbc.Label("Risk")])
+                                ], md=3),
+
+                                dbc.Col([
+                                    dbc.FormFloating([dbc.Input(id="new-proj-budget",type="number"),dbc.Label("Budget")])
+                                ], md=3),
+
+                                dbc.Col([
+                                    dbc.Row([
+                                        dbc.Col([
+                                            dbc.FormFloating([dbc.Input(id="new-proj-start",type="date"),dbc.Label("Start Date")])
+                                        ], md=6),
+                                        dbc.Col([
+                                            dbc.FormFloating([dbc.Input(id="new-proj-due",type="date"),dbc.Label("Due Date")])
+                                        ], md=6),
+                                    ])
+                                ], md=3),
+                            ], className="mb-3"),
+
+                            dbc.Row([
+                                dbc.Col([
+                                    dbc.FormFloating([dbc.Textarea(id="new-proj-comments"),dbc.Label("Comments")])
+                                ], md=12)
+                            ], className="mb-3"),
+                        ]),
+                    ]),
+                    html.Div([
+                        dbc.Button("Submit",id="new-proj-submit", n_clicks=0, color="info", disabled=True),
+                        html.Div(id="save-attempt-output")
+                    ],style={
+                        "padding":"12px 24px",
+                        "display":"flex",
+                        "justifyContent":"space-between",
+                        "borderTop":"1px solid #ddd"
+                    })
+                ], style={"flex":"1","display":"flex","flexDirection":"column"}),
+            ],
+        ),
+        dcc.Store(id="current-edit-id"),
+        dcc.Store(id='page-store', data='blueprint'),
+        dcc.Store(id='grid-data-store'),
+        dcc.Store(id='selected-row-store'),
+        dcc.Store(id="filter-project-mode", data="all"),
+        dcc.Store(id='edit-data-store'),
+        dcc.Store(id="output-div"),
+        dcc.Store(id="filtered-data-store"),
+        html.Div(id="user-output"),
+        html.Div(id="dummy"),
+        dcc.Store(id="form-step",data=1),
+        dcc.Store(id="assign-relevant-project")
+    ])
+])
+
+df_columns_table = projects_df.sort_values(by=['ACTUAL_END_DATE'])
+df_columns_table= df_columns_table[['ID','NAME']]
+
+num_columns = 4
+split_dfs = [df_columns_table.iloc[i::num_columns] for i in range(num_columns)]
+columns = [
+    html.Div([
+        html.Table([
+            html.Tr([html.Th(""),html.Th("Project")],style={'font-size':'10px'})] +
+            [html.Tr([html.Td(row[col]) for col in df_columns_table.columns],style={'font-size':'10px'}) for _, row in split_df.iterrows()]
+        )
+    ], style={"flex":"1","margin":"10px"})
+    for split_df in split_dfs]  
+
+#-----------------------------------------------------------------------------
+# Building pre-requisite callbacks/functions
+#-----------------------------------------------------------------------------
+
+def generate_project_cards(filter_mode="all", user_id="GONZJ243"):
+    
+    if filter_mode == "mine":
+        filtered_projects = projects_df[projects_df.ID.isin(
+            roles_df[roles_df.LAN_ID == user_id].PROJECT_ID
+        )]
+    elif filter_mode == "team":
+        filtered_users = users_df[users_df.LEAD_LAN_ID == user_id].LAN_ID
+        
+        filtered_projects = projects_df[projects_df.ID.isin(
+            roles_df[roles_df.LAN_ID.isin(filtered_users)].PROJECT_ID
+        )]
+    else:
+        filtered_projects = projects_df
+    return [
+        dbc.Col(width=3, children=[
+            html.Div(style={
+                "backgroundColor":"white",
+                "borderRadius":"12px",
+                "boxShadow":"0 2px 8px rgba(0,0,0,0.05)",
+                "padding":"20px",
+                "marginBottom":"20px",
+                "height":"100%"
+            }, children=[
+                html.Div(style={"display":"flex","justifyContent":"space-between","alignItems":"center","marginBottom":"10px"}, children = [
+                    html.H2(p["NAME"], style={"fontSize":"14px","marginBottom":"10px"}),
+                    dbc.Button("✏️ Edit", n_clicks=0, color="primary", size="sm", className="mt-3",id={"type":"edit-btn-dbc","index":p["ID"]}, outline=True)
+                ]),
+                
+                html.Div([
+                    html.Span("Total Score:",style={"fontSize":"12px","color":"#888","marginRight":"4px"}),
+                    html.Span(p["TOTAL_SCORE"],style={
+                        "fontSize":"11px",
+                        "padding":"2px 8px",
+                        "borderRadius":"999px",
+                        "backgroundColor":{
+                            "On Track":"#6699FF",
+                            "Off Track":"#FF7539"
+                        }.get(p["RISK"],"#eee"),
+                        "color":{
+                            "On Track":"#E8F0FF",
+                            "Off Track":"#E8F0FF"
+                        }.get(p["RISK"],"#333"),
+                        "display":"inline-block"
+                    })
+                ], style={"marginTop":"5px"}),
+                
+                html.Div([
+                    html.Span("Risk:",style={"fontSize":"12px","color":"#888","marginRight":"4px"}),
+                    html.Span(p["RISK"],style={
+                        "fontSize":"11px",
+                        "padding":"2px 8px",
+                        "borderRadius":"999px",
+                        "backgroundColor":{
+                            "On Track":"#6699FF",
+                            "Off Track":"#FF7539"
+                        }.get(p["RISK"],"#eee"),
+                        "color":{
+                            "On Track":"#E8F0FF",
+                            "Off Track":"#E8F0FF"
+                        }.get(p["RISK"],"#333"),
+                        "display":"inline-block"
+                    })
+                ], style={"marginTop":"5px"}),
+                
+                html.Div([
+                    html.Span("Status:",style={"fontSize":"12px","color":"#888","marginRight":"4px"}),
+                    html.Span(p["STATUS"],style={
+                        "fontSize":"11px",
+                        "padding":"2px 8px",
+                        "borderRadius":"999px",
+                        "backgroundColor":{
+                            "Not Started":"#FF7539",
+                            "In Progress":"#E3E3E3",
+                            "Closed":"#6699FF"
+                        }.get(p["STATUS"],"#eee"),
+                        "color":{
+                            "Not Started":"#E8F0FF",
+                            "In Progress":"#141313",
+                            "Closed":"#E8F0FF"
+                        }.get(p["STATUS"],"#333"),
+                        "display":"inline-block"
+                    })
+                ], style={"marginTop":"5px"}),
+                html.Div("Team:",style={"marginTop":"5px","fontSize":"12px","color":"#888"}),
+                html.Div(render_avatars(p["ID"]), style={"marginTop":"5px","display":"flex"})
+            ])
+        ], style={"height":"100%"}) for _,p in filtered_projects.sort_values(by="TOTAL_SCORE", ascending=False).iterrows()
+    ]
+
+
+def custom_sort(iterable, order_dict):
+    return sorted(iterable, key=lambda x: order_dict.get(x, float('inf')))
+
+#-----------------------------------------------------------------------------
+# Building Layout Screens
+#-----------------------------------------------------------------------------
+
+home_layout = html.Div(style={"flexGrow":1, "padding":"30px","backgroundColor":"#f9fafa","width":"100%"}, children=[
+    dbc.Row(
+        id="project-cards",
+        children=[]
+        #generate_project_cards()
+    ),
+    dcc.Store(id="current-edit-id-dbc"),
+])
+
+
+
+list_layout = html.Div(
+    id="list-layout-content",
+    style={"flexGrow":1, "padding":"30px","backgroundColor":"#f9fafa","width":"100%"},
+    children=[]
+)
+
+blueprint_layout = html.Div([
+    html.Div(
+        id="blueprint-layout-content",
+        style={"flexGrow":1, "padding":"30px","backgroundColor":"#f9fafa","width":"100%"},
+        children=[]
+    ),
+    html.Div(
+        id="initiatives-layout-content",
+        style={"flexGrow":1, "padding":"30px","backgroundColor":"#f9fafa","width":"100%"},
+        children=[]
+    ),
+    html.Div(
+        id="initiatives-list-layout-content",
+        style={"flexGrow":1, "padding":"30px","backgroundColor":"#f9fafa","width":"100%"},
+        children=[]
+    )
+])
+    
+dimensions_layout = html.Div([
+    dbc.Row(
+        id="dimensions-layout-content",
+        style={"display":"flex","flexWrap":"wrap"}
+    ),
+    html.Div(
+        id="dimensions-drilldown-layout-content",
+        style={"flexGrow":1, "padding":"30px","backgroundColor":"#f9fafa","width":"100%"},
+        children=[]
+    )
+])
+
+gantt_layout = html.Div(
+    id="gantt-layout-content",
+    style={"flexGrow":1, "padding":"30px","backgroundColor":"#f9fafa","width":"100%"},
+    children=[]
+)
+
+roadmap_layout = dbc.Container([
+    html.Div([
+        html.Hr(),
+        html.Label("Select the dimension you want to aggregate the roadmap by"),
+        dcc.Dropdown(
+            id='color-dropdown',
+            options=dd_options,
+            value='TEAM'
+        ),
+        dcc.Graph(id='roadmap-scatter-plot',config={'displayModeBar':False},selectedData={}, style={'margin':'1px','padding':'2px'}),
+        html.Hr(),
+        html.Div(columns, style={"display":"flex","flex-wrap":"wrap", 'font-size':'14px', 'margin':'1px','padding':'2px'}),
+        dcc.Graph(id='roadmap-quant-plot',config={'displayModeBar':False},selectedData={}, style={'margin':'1px','padding':'2px'}),
+        dcc.Graph(id='roadmap-quant-month',config={'displayModeBar':False},selectedData={}, style={'margin':'1px','padding':'2px'}),
+        html.Div([
+            html.H4("Summary by Region"),
+            dag.AgGrid(
+                id='region-grid',
+                columnDefs = region_columns,
+                rowData = region_summary.to_dict('records'),
+                columnSize="responsive",
+                dashGridOptions = {
+                    'rowSelection': "single"
+                },
+                style={"height":300}
+            ),
+            html.H4("Details by Scope"),
+            dag.AgGrid(
+                id='country-grid',
+                columnDefs = country_columns,
+                rowData = [],
+                columnSize="responsive",
+                dashGridOptions = {
+                    'rowSelection': "single"
+                },
+                style={"height":300}
+            ),
+        ]),
+    ], style={"height": "100%","overflow":"scroll"})
+], fluid=True)
+
+charter_layout = dbc.Container([
+
+    html.Div([
+                html.Label("Select the relevant project"),
+                dcc.Dropdown(
+                    projects_df['NAME'].unique(),
+                    "Customer Segmentation",
+                    id='charter-project',
+                    style ={'margin':'10px'}
+                ),
+                
+                html.Div(id='charter-content', style={'padding':'10px'})
+            ], style={"height": "800px","overflow":"scroll"})
+], fluid=True)
+
+#-----------------------------------------------------------------------------
+# Building Layout
+#-----------------------------------------------------------------------------
+
+@app.callback(
+    Output('page-store', 'data'),
+    [
+        Input('sidebar-btn-home', 'n_clicks'),
+        Input('sidebar-btn-list', 'n_clicks'),
+        Input('sidebar-btn-blue', 'n_clicks'),
+        Input('sidebar-btn-dims', 'n_clicks'),
+        Input('sidebar-btn-gant', 'n_clicks'),
+        Input('sidebar-btn-road', 'n_clicks'),
+        Input('sidebar-btn-char', 'n_clicks')
+    ],
+    prevent_initial_call=True)
+def update_page(n_home, n_list, n_blueprint, n_dimensions, n_gantt, n_roadmap, n_charter):
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return dash.no_update
+    button_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    return {
+        'sidebar-btn-home':'home',
+        'sidebar-btn-list':'list',
+        'sidebar-btn-blue':'blueprint',
+        'sidebar-btn-dims':'dimensions',
+        'sidebar-btn-gant':'gantt',
+        'sidebar-btn-road':'roadmap',
+        'sidebar-btn-char':'charter'
+    }.get(button_id, 'blueprint')
+
+@app.callback(
+    Output('main-content-div', 'children'),
+    Input('page-store', 'data'))
+def render_page(screen):
+    if screen == 'blueprint':
+        return blueprint_layout
+    if screen == 'home':
+        return home_layout
+    elif screen == 'dimensions':
+        return dimensions_layout
+    elif screen == 'gantt':
+        return gantt_layout
+    elif screen == 'roadmap':
+        return roadmap_layout
+    elif screen == 'charter':
+        return charter_layout
+    elif screen == 'list':
+        return list_layout
+    return home_blueprint
+
+@app.callback(
+    Output("filter-project-mode","data"),
+    Output('filter-indicator-text','children'),
+    
+    Input("btn-all","n_clicks"),
+    Input("btn-mine","n_clicks"),
+    Input("btn-team","n_clicks"),
+    
+    Input("btn-off","n_clicks"),
+    Input("btn-on","n_clicks"),
+    
+    Input("btn-glob","n_clicks"),
+    Input("btn-amer","n_clicks"),
+    Input("btn-noam","n_clicks"),
+    Input("btn-lata","n_clicks"),
+    
+    prevent_initial_call=True)
+def update_filtered_cards(btn_all,btn_mine,btn_team, btn_off, btn_on, btn_glob, btn_amer, btn_noam, btn_lata):
+    triggered = ctx.triggered_id
+    
+    if triggered == "btn-mine":
+        return "mine", html.Span("Displaying projects assigned to current user", className="text-muted me-2")
+    elif triggered == "btn-team":
+        return "team", html.Span("Displaying projects assigned to user's team members", className="text-muted me-2")
+    elif triggered == "btn-all":
+        return "all", html.Span("Displaying all projects", className="text-muted me-2")
+    
+    elif triggered == "btn-glob":
+        return "global", html.Span("Displaying projects with global scope", className="text-muted me-2")
+    
+    elif triggered == "btn-amer":
+        return "amer", html.Span("Displaying projects with AMERICAS scope", className="text-muted me-2")
+    
+    elif triggered == "btn-noam":
+        return "noam", html.Span("Displaying projects with North America scope", className="text-muted me-2")
+    
+    elif triggered == "btn-lata":
+        return "latam", html.Span("Displaying projects with Latin America scope", className="text-muted me-2")
+    
+    elif triggered == "btn-off":
+        return "off", html.Span("Displaying off track projects", className="text-muted me-2")
+    
+    elif triggered == "btn-on":
+        return "on", html.Span("Displaying on tracks projects", className="text-muted me-2")
+    return "all", html.Span("Displaying all projects", className="text-muted me-2")
+
+@app.callback(
+    Output("list-layout-content","children"),
+    Input("filter-project-mode","data"),
+    Input("filtered-data-store","data")
+)
+def update_list_grid_data(filter_mode, filtered_data):
+    request_headers=dict(request.headers)
+    auth_info_browser=client.get_auth_info_from_browser_headers(request_headers)
+    logging.info((auth_info_browser))
+    logged_user = auth_info_browser["authIdentifier"].upper()
+    
+    initial_df = pd.DataFrame(filtered_data)
+    
+    filtered_projects = initial_df.copy()
+    
+    if filter_mode == "mine":
+        filtered_projects = initial_df[initial_df.ID.isin(
+            roles_df[roles_df.LAN_ID == logged_user].PROJECT_ID
+        )]
+        
+    elif filter_mode == "team":
+        filtered_users = users_df[users_df.LEAD_LAN_ID == logged_user].LAN_ID
+        
+        filtered_projects = initial_df[initial_df.ID.isin(
+            roles_df[roles_df.LAN_ID.isin(filtered_users)].PROJECT_ID
+        )]
+    
+    elif filter_mode == "off":
+        selected_projects = projects_df[projects_df.RISK == "Off Track"].PROJECT_ID
+        
+        filtered_projects = initial_df[initial_df.ID.isin(
+            initial_df[initial_df.ID.isin(selected_projects)].ID
+        )]
+    
+    elif filter_mode == "on":
+        selected_projects = projects_df[projects_df.RISK == "On Track"].PROJECT_ID
+        filtered_projects = initial_df[initial_df.ID.isin(
+            initial_df[initial_df.ID.isin(selected_projects)].ID
+        )]
+        
+    elif filter_mode == "global":
+        selected_projects = projects_df[projects_df.REGION == "Global"].PROJECT_ID
+        filtered_projects = initial_df[initial_df.ID.isin(
+            initial_df[initial_df.ID.isin(selected_projects)].ID
+        )]
+        
+    elif filter_mode == "amer":
+        selected_projects = projects_df[projects_df.REGION == "Americas"].PROJECT_ID
+        filtered_projects = initial_df[initial_df.ID.isin(
+            initial_df[initial_df.ID.isin(selected_projects)].ID
+        )]
+        
+    elif filter_mode == "noam":
+        selected_projects = projects_df[projects_df.REGION == "North America"].PROJECT_ID
+        filtered_projects = initial_df[initial_df.ID.isin(
+            initial_df[initial_df.ID.isin(selected_projects)].ID
+        )]
+        
+    elif filter_mode == "latam":
+        selected_projects = projects_df[projects_df.REGION == "Latin America"].PROJECT_ID
+        filtered_projects = initial_df[initial_df.ID.isin(
+            initial_df[initial_df.ID.isin(selected_projects)].ID
+        )]
+    
+    list_grid = html.Div([
+        dag.AgGrid(
+            id='pm-table',
+            columnDefs=list_panel_columns,
+            rowData= filtered_projects.to_dict("records"),
+            columnSize="sizeToFit",
+            defaultColDef={
+                "editable": True,
+                'wrapHeaderText': True,
+                'autoHeaderHeight': True,
+                "filter": "agTextColumnFilter"
+            },
+            dashGridOptions={"animateRows": False},
+            style=grid_style,
+            rowStyle=grid_row_style,
+            csvExportParams={"fileName": "sca_extract.csv"}
+        ),
+        html.Div(id="list-output-div")
+    ])
+        
+    
+    return list_grid
+    
+@app.callback(
+    Output("project-cards","children"),
+    Input("filter-project-mode","data"),
+    Input("filtered-data-store","data")
+)
+def display_filtered_cards(filter_mode, filtered_data):
+    request_headers=dict(request.headers)
+    auth_info_browser=client.get_auth_info_from_browser_headers(request_headers)
+    logging.info((auth_info_browser))
+    logged_user = auth_info_browser["authIdentifier"].upper()
+    
+    initial_df = pd.DataFrame(filtered_data)
+    filtered_projects = initial_df.copy()
+    
+    if filter_mode == "mine":
+        filtered_projects = projects_df[projects_df.ID.isin(
+            roles_df[roles_df.LAN_ID == logged_user].PROJECT_ID
+        )]
+    elif filter_mode == "team":
+        filtered_users = users_df[users_df.LEAD_LAN_ID == logged_user].LAN_ID
+        
+        filtered_projects = projects_df[projects_df.ID.isin(
+            roles_df[roles_df.LAN_ID.isin(filtered_users)].PROJECT_ID
+        )]
+    
+    elif filter_mode == "off":
+        selected_projects = projects_df[projects_df.RISK == "Off Track"].PROJECT_ID
+        
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )]
+    
+    elif filter_mode == "on":
+        selected_projects = projects_df[projects_df.RISK == "On Track"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )]
+        
+    elif filter_mode == "global":
+        selected_projects = projects_df[projects_df.REGION == "Global"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )]
+        
+    elif filter_mode == "amer":
+        selected_projects = projects_df[projects_df.REGION == "Americas"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )]
+        
+    elif filter_mode == "noam":
+        selected_projects = projects_df[projects_df.REGION == "North America"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )]
+        
+    elif filter_mode == "latam":
+        selected_projects = projects_df[projects_df.REGION == "Latin America"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )]
+    
+    else:
+        filtered_projects = projects_df
+    
+    
+    if filtered_projects.empty:
+        return html.Div([
+            dbc.Alert("No relevant projects on the database. Please try with another filter.", color="info"),   
+        ])
+    
+    
+    
+    return [
+        dbc.Col(width=4, children=[
+            html.Div(
+                style={
+                    "display":"flex",
+                    "align-items":"stretch",
+                    "margin":"10px",
+                },
+                children=[
+                    html.Div(style={
+                        "width": "8px",
+                        "backgroundColor":{
+                            "Off Track":"#F03844",
+                            "On Track":"#55B348",
+                        }.get(p["RISK"],"#E3E3E3"),
+                        "borderTopLeftRadius": "12px",
+                        "borderBottomLeftRadius": "12px"
+                    }),
+
+                    html.Div(
+                        className="task-card",
+                        style={
+                            "flex": 1,
+                            "background": "white",
+                            "borderTopRightRadius": "12px",
+                            "borderBottomRightRadius": "12px",
+                            "padding": "16px",
+                            "boxShadow": "0 2px 6px rgba(0,0,0,0.08)",
+                            "display": "flex",
+                            "flexDirection": "column",
+                            "gap": "12px",
+                            "fontFamily": "sans-serif"
+                        },
+                        children=[
+                            html.Div(
+                                style={"display": "flex", "justifyContent": "space-between", "alignItems": "center"},
+                                children=[
+                                    html.H4(p["NAME"], style={"margin": 0, "fontSize": "1.1rem", "fontWeight": "600"})
+                                ]
+                            ),
+                            html.P(
+                                p["DESCRIPTION"],
+                                style={"color": "#666", "fontSize": "0.9rem", "margin": 0}
+                            ),
+                            html.Div(
+                                style={"display": "flex", "gap": "16px", "fontSize": "0.85rem", "color": "#444"},
+                                children=[
+                                    html.Div(["📅", html.Span(p["ACTUAL_END_DATE_FMT"])], style={"display": "flex", "gap": "6px"}),
+                                    html.Div(["🚧", html.Span(p["STATUS"])], style={"display": "flex", "gap": "6px"}),
+                                    html.Div(["🎚️", html.Span(p["TIER"])], style={"display": "flex", "gap": "6px"})
+                                ]
+                            ),
+                            html.Div(
+                                style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "borderTop": "1px solid #eee", "paddingTop": "10px"},
+                                children=[
+                                    html.Div(
+                                        children=[
+                                            
+                                        ],
+                                        style={"display": "flex"}
+                                    ),
+                                    html.Div(
+                                        children=[
+                                            html.Div(render_avatars(p["ID"]), style={"display": "flex", "gap": "4px","marginTop":"5px"}),
+                                            html.Div([
+                                                dbc.Button("✏️ Edit", n_clicks=0, color="primary", size="sm", id={"type":"edit-btn-dbc","index":p["ID"]}, style={"fontSize":"12px"}, outline=True),
+                                                dbc.Button("🛫 Assign", n_clicks=0, color="primary", size="sm",id={"type":"assign-btn-dbc","index":p["ID"]}, style={"fontSize":"12px"}, outline=True) 
+                                            ], style={"display": "flex", "gap": "4px"})
+                                        ],
+                                        style={"display": "flex", "gap": "16px", "fontSize": "0.85rem", "color": "#666"}
+                                    )
+                                ]
+                            )
+                        ]
+                    )
+                ]
+            ),
+        ]) for _,p in filtered_projects.sort_values(by="TOTAL_SCORE", ascending=False).iterrows()
+    ]
+    
+@app.callback(
+    Output('blueprint-layout-content','children'),
+    Input('filter-project-mode','data'),
+    Input("filtered-data-store","data")
+)
+def update_blueprint_view(filter_mode, filtered_data):
+    request_headers=dict(request.headers)
+    auth_info_browser=client.get_auth_info_from_browser_headers(request_headers)
+    logging.info((auth_info_browser))
+    logged_user = auth_info_browser["authIdentifier"].upper()
+    
+    initial_df = pd.DataFrame(filtered_data)
+    filtered_projects = initial_df.copy()
+        
+    if filter_mode == "mine":
+        filtered_projects = projects_df[projects_df.ID.isin(
+            roles_df[roles_df.LAN_ID == logged_user].PROJECT_ID
+        )]
+    elif filter_mode == "team":
+        filtered_users = users_df[users_df.LEAD_LAN_ID == logged_user].LAN_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            roles_df[roles_df.LAN_ID.isin(filtered_users)].PROJECT_ID
+        )]
+    elif filter_mode == "off":
+        selected_projects = projects_df[projects_df.RISK == "Off Track"].PROJECT_ID
+        
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )] 
+    elif filter_mode == "on":
+        selected_projects = projects_df[projects_df.RISK == "On Track"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )]
+    elif filter_mode == "global":
+        selected_projects = projects_df[projects_df.REGION == "Global"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )]
+    elif filter_mode == "amer":
+        selected_projects = projects_df[projects_df.REGION == "Americas"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )]
+    elif filter_mode == "noam":
+        selected_projects = projects_df[projects_df.REGION == "North America"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )]
+    elif filter_mode == "latam":
+        selected_projects = projects_df[projects_df.REGION == "Latin America"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+       )]
+    else:
+        filtered_projects = projects_df
+    
+    
+    if filtered_projects.empty:
+        return []
+    
+    cards = []
+    for p in principles:
+        count = filtered_projects[filtered_projects['PRINCIPLE'] == p].shape[0]
+        data = principle_data[p]
+        card = create_card(data['title'], count, data['style']['background-color'])
+        cards.append(card)  
+    
+    return html.Div(cards)
+    
+@app.callback(
+    Output('initiatives-layout-content','children'),
+    Input('filter-project-mode','data'),
+    Input("filtered-data-store","data")
+)
+def update_blueprint_grid_view(filter_mode, filtered_data):
+    request_headers=dict(request.headers)
+    auth_info_browser=client.get_auth_info_from_browser_headers(request_headers)
+    logging.info((auth_info_browser))
+    logged_user = auth_info_browser["authIdentifier"].upper()
+    
+    initial_df = pd.DataFrame(filtered_data)
+    filtered_projects = initial_df.copy()
+    
+    if filter_mode == "mine":
+        filtered_projects = projects_df[projects_df.ID.isin(
+            roles_df[roles_df.LAN_ID == logged_user].PROJECT_ID
+        )]
+    elif filter_mode == "team":
+        filtered_users = users_df[users_df.LEAD_LAN_ID == logged_user].LAN_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            roles_df[roles_df.LAN_ID.isin(filtered_users)].PROJECT_ID
+        )]
+    elif filter_mode == "off":
+        selected_projects = projects_df[projects_df.RISK == "Off Track"].PROJECT_ID
+        
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )] 
+    elif filter_mode == "on":
+        selected_projects = projects_df[projects_df.RISK == "On Track"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )]
+    elif filter_mode == "global":
+        selected_projects = projects_df[projects_df.REGION == "Global"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )]
+    elif filter_mode == "amer":
+        selected_projects = projects_df[projects_df.REGION == "Americas"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )]
+    elif filter_mode == "noam":
+        selected_projects = projects_df[projects_df.REGION == "North America"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )]
+    elif filter_mode == "latam":
+        selected_projects = projects_df[projects_df.REGION == "Latin America"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+       )]
+    else:
+        filtered_projects = projects_df
+    
+    
+    if filtered_projects.empty:
+        return []
+        
+    
+    filtered_projects['INITIATIVE'] = filtered_projects['INITIATIVE'].replace('',pd.NA).fillna('Not Assigned')
+    grouped = filtered_projects.groupby(['INITIATIVE','PRINCIPLE'])['ID'].count().reset_index()
+    
+    principle_map = {}
+    for _, row in grouped.iterrows():
+        p = row['PRINCIPLE']
+        i = row['INITIATIVE']
+        c = row['ID']
+        principle_map.setdefault(p, []).append((i,c))
+    
+    expected_structure = {
+        'Trust is Everything': ['GSC AMER Sustainability/Net Zero 2040', 'People - Wellness, Safety, Growth & Equity Culture'],
+        'Science Will Win': ['Next Gen T2-T3 Capabilities: Planning Data','Next Gen T2-T3 Capabilities: Continuous Improvement','Next Gen T2-T3 Capabilities: Process Mapping','Next Gen T2-T3 Capabilities: Predictive Analytics','Next Gen T2-T3 Capabilities: Self-healing Data'],
+        'Disruption Calls for Innovation': ['NextGen T1 Planning','NextGen T1 Delivery'],
+        'Time is Life': ['Top & Standard Service Transformation'],
+        'Execution Makes the Difference': ['EMAP Implementation','Market Model Elevation','Risk Management']
+    }
+    
+    lookup = {
+        principle: dict(initiatives)
+        for principle, initiatives in principle_map.items()
+    }
+    
+    complete_result = {}
+    
+    for principle, expected_initiatives in expected_structure.items():
+        initiatives_count = []
+        for initiative in expected_initiatives:
+            count = lookup.get(principle, {}).get(initiative,0)
+            initiatives_count.append((initiative, count))
+        complete_result[principle] = initiatives_count
+    
+    
+    max_rows = max(len(v) for v in complete_result.values())
+    principles_list = sorted(complete_result.keys())
+    principles_order = {'Trust is Everything': 1, 'Science Will Win': 2, 'Disruption Calls for Innovation': 3, 'Time is Life': 4, 'Execution Makes the Difference':5}
+
+    principles_list = custom_sort(principles_list, principles_order)
+    
+    headers = [html.Th(p) for p in principles]
+    rows = []
+    
+    for i in range(max_rows):
+        row_cells = []
+        for p in principles:
+            try:
+                initiative, count = complete_result[p][i]
+                badge_color = principle_colors_badge.get(p, 'secondary')
+                badge = dbc.Badge(
+                    f"{initiative} ({count})",
+                    color=badge_color,
+                    pill=True,
+                    id={'type':'badge','initiative':initiative,'principle':p},
+                    className="me-1 text-decoration-none",
+                    style={'cursor':'pointer', 'font-size':'12px', 'wrapText': True,'autoHeight': True}
+                )
+                row_cells.append(html.Td(badge))
+            except IndexError:
+                row_cells.append(html.Td())
+        rows.append(html.Tr(row_cells))
+        
+        
+    inits_table = dbc.Table(
+        [html.Thead(html.Tr(headers))] + [html.Tbody(rows)],
+        bordered = False,
+        striped = False,
+        hover = True,
+        responsive = True,
+        style = {'border':'solid','borderColor':'white'}
+    )
+    return html.Div(inits_table)
+    
+@app.callback(
+    Output('dimensions-layout-content','children'),
+    Input('filter-project-mode','data'),
+    Input("filtered-data-store","data")
+)
+def update_dimensions_view(filter_mode, filtered_data):
+    request_headers=dict(request.headers)
+    auth_info_browser=client.get_auth_info_from_browser_headers(request_headers)
+    logging.info((auth_info_browser))
+    logged_user = auth_info_browser["authIdentifier"].upper()
+    
+    initial_df = pd.DataFrame(filtered_data)
+    filtered_projects = initial_df.copy()
+    
+    if filter_mode == "mine":
+        filtered_projects = projects_df[projects_df.ID.isin(
+            roles_df[roles_df.LAN_ID == logged_user].PROJECT_ID
+        )]
+    elif filter_mode == "team":
+        filtered_users = users_df[users_df.LEAD_LAN_ID == logged_user].LAN_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            roles_df[roles_df.LAN_ID.isin(filtered_users)].PROJECT_ID
+        )]
+    elif filter_mode == "off":
+        selected_projects = projects_df[projects_df.RISK == "Off Track"].PROJECT_ID
+        
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )] 
+    elif filter_mode == "on":
+        selected_projects = projects_df[projects_df.RISK == "On Track"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )]
+    elif filter_mode == "global":
+        selected_projects = projects_df[projects_df.REGION == "Global"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )]
+    elif filter_mode == "amer":
+        selected_projects = projects_df[projects_df.REGION == "Americas"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )]
+    elif filter_mode == "noam":
+        selected_projects = projects_df[projects_df.REGION == "North America"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )]
+    elif filter_mode == "latam":
+        selected_projects = projects_df[projects_df.REGION == "Latin America"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+       )]
+    else:
+        filtered_projects = projects_df
+    
+    
+    if filtered_projects.empty:
+        return []
+    
+    
+    cards = []
+    for dim in dimensions:
+        count = filtered_projects[filtered_projects['DIMENSION'] == dim].shape[0]
+        cards.append(make_dimension_card(dim,count))
+    return cards
+
+@app.callback(
+    Output('dimensions-drilldown-layout-content','children'),
+    Input({'type':'dimension-btn','index':dash.ALL}, 'n_clicks'),
+    Input("filtered-data-store","data"),
+    State('filter-project-mode','data'),
+    prevent_initial_call = True)
+def update_dimensions_drilldown_view(n_clicks_list, filtered_data, filter_mode):
+    ctx = callback_context
+    if not ctx.triggered:
+        return dash.no_update
+    
+    clicked_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    dim_selected = eval(clicked_id)['index']
+    
+    request_headers=dict(request.headers)
+    auth_info_browser=client.get_auth_info_from_browser_headers(request_headers)
+    logging.info((auth_info_browser))
+    logged_user = auth_info_browser["authIdentifier"].upper()
+    
+    initial_df = pd.DataFrame(filtered_data)
+    filtered_projects = initial_df.copy()
+    
+    if filter_mode == "mine":
+        filtered_projects = projects_df[projects_df.ID.isin(
+            roles_df[roles_df.LAN_ID == logged_user].PROJECT_ID
+        )]
+    elif filter_mode == "team":
+        filtered_users = users_df[users_df.LEAD_LAN_ID == logged_user].LAN_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            roles_df[roles_df.LAN_ID.isin(filtered_users)].PROJECT_ID
+        )]
+    elif filter_mode == "off":
+        selected_projects = projects_df[projects_df.RISK == "Off Track"].PROJECT_ID
+        
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )] 
+    elif filter_mode == "on":
+        selected_projects = projects_df[projects_df.RISK == "On Track"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )]
+    elif filter_mode == "global":
+        selected_projects = projects_df[projects_df.REGION == "Global"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )]
+    elif filter_mode == "amer":
+        selected_projects = projects_df[projects_df.REGION == "Americas"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )]
+    elif filter_mode == "noam":
+        selected_projects = projects_df[projects_df.REGION == "North America"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )]
+    elif filter_mode == "latam":
+        selected_projects = projects_df[projects_df.REGION == "Latin America"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+       )]
+    else:
+        filtered_projects = projects_df
+    
+    
+    if filtered_projects.empty:
+        return []
+    
+    filtered = filtered_projects[filtered_projects["DIMENSION"] == dim_selected]
+    
+    cards = []
+    for _, row in filtered.iterrows():
+        card = html.Div([
+            html.Div([
+                html.Div(f"{row['NAME']}", style={'fontWeight':'bold','fontSize':'16px'}),
+                html.Div(f"{row['STATUS']}", style={'color':'#666'}),
+                html.Div(f"{row['DIMENSION']}", style={'color':'#888','fontSize':'14px'})
+            ], style={'padding':'12px'})
+        ], style={
+            'border':'1px solid #eee',
+            'borderRadius':'8px',
+            'boxShadow':'0 2px 6px rgba(0,0,0,0.05)',
+            'margin':'10px',
+            'width':'220px',
+            'backgroundColor':'#fff'
+        })
+        
+        cards.append(card)
+    return html.Div([
+        html.H5(f"Projects in dimension: {dim_selected}"),
+        html.Div(cards, style={'display':'flex','flexWrap':'wrap','gap':'10px'})
+    ])
+    
+@app.callback(
+    Output('gantt-layout-content','children'),
+    Input('filter-project-mode','data'),
+    Input("filtered-data-store","data")
+)
+def update_gantt_layout(filter_mode, filtered_data):
+    request_headers=dict(request.headers)
+    auth_info_browser=client.get_auth_info_from_browser_headers(request_headers)
+    logging.info((auth_info_browser))
+    logged_user = auth_info_browser["authIdentifier"].upper()
+    
+    initial_df = pd.DataFrame(filtered_data)
+    filtered_projects = initial_df.copy()
+    
+    if filter_mode == "mine":
+        filtered_projects = projects_df[projects_df.ID.isin(
+            roles_df[roles_df.LAN_ID == logged_user].PROJECT_ID
+        )]
+    elif filter_mode == "team":
+        filtered_users = users_df[users_df.LEAD_LAN_ID == logged_user].LAN_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            roles_df[roles_df.LAN_ID.isin(filtered_users)].PROJECT_ID
+        )]
+    elif filter_mode == "off":
+        selected_projects = projects_df[projects_df.RISK == "Off Track"].PROJECT_ID
+        
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )] 
+    elif filter_mode == "on":
+        selected_projects = projects_df[projects_df.RISK == "On Track"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )]
+    elif filter_mode == "global":
+        selected_projects = projects_df[projects_df.REGION == "Global"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )]
+    elif filter_mode == "amer":
+        selected_projects = projects_df[projects_df.REGION == "Americas"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )]
+    elif filter_mode == "noam":
+        selected_projects = projects_df[projects_df.REGION == "North America"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )]
+    elif filter_mode == "latam":
+        selected_projects = projects_df[projects_df.REGION == "Latin America"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+       )]
+    else:
+        filtered_projects = projects_df
+    
+    
+    if filtered_projects.empty:
+        return []
+    
+    gantt_div = html.Div([
+        html.Div(style={
+            'position':'absolute',
+            'left':f'{today_position}%',
+            'top':'0',
+            'bottom':'0',
+            'width':'2px',
+            'backgroundColor':'#FF4C4C',
+            'zIndex':'10'
+        }),
+        html.Div([
+            html.Div(make_timeline_bar(row), style={
+                'position':'relative',
+                'height':'40px',
+                'marginBottom':'12px',
+                'paddingTop':'6px',
+                'overflow':'visible'
+            })
+            for _, row in filtered_projects.iterrows()    
+        ])
+        
+    ], style={
+        'position':'relative',
+        'width':'100%',
+        'padding':'20px',
+        'backgroundColor':'#fff',
+        'border':'1px solid #ddd',
+        'overflowY':'auto'
+    })
+    
+    
+    return html.Div(gantt_div,style={'padding':'40px'})
+    
+@app.callback(
+    Output("edit-panel","children"),
+    Output("edit-panel","is_open"),
+    Input({"type":"edit-btn-dbc","index":dash.ALL}, "n_clicks"),
+    prevent_initial_call = True)
+def handle_edit_panel_state(edit_clicks):
+    triggered = ctx.triggered_id
+    
+    if not triggered or not isinstance(triggered,dict):
+        raise PreventUpdate
+    index = triggered["index"]
+    for i, btn in enumerate(ctx.inputs_list[0]):
+        if btn["id"]["index"] == index:
+            if not edit_clicks[i]:
+                raise PreventUpdate
+            break
+    else:
+        raise PreventUpdate
+        
+     
+    project_data = projects_df[projects_df.ID == index]
+    project_name = project_data["NAME"].iloc[0]
+    project_desc = project_data["DESCRIPTION"].iloc[0]
+
+    if not project_data.empty:
+        grid = dag.AgGrid(
+            id="edit-grid-dbc",
+            rowData = project_data.to_dict('records'),
+            columnDefs = edit_panel_columns,
+            defaultColDef={"resizable":True, "editable":True},
+            className="ag-theme-material",
+            columnSize="sizeToFit",
+            style={"height":"450px","width":"100%","border":"none","fontSize":"12px"}
+        )
+
+        edit_contents = html.Div([
+            html.Div(style={"flex":"0 0 10%","display":"flex","justifyContent":"space-between","alignItems":"center"}, children = [
+                html.H3("Edit Project:", style={"marginBottom":"10px", "fontSize":"14px","font-weight":"600"}),
+            ]),
+            dbc.Input(id="edit-panel-name",value=project_name, type="text", className="m-2 fw-bolder fs-5 border border-0", style={"flex":"0 0 10%"}),
+            dbc.Input(id="edit-panel-desc",value=project_desc, type="Textarea", className="m-2 fw-light fs-7 border border-0 h-fit", style={"flex":"0 0 10%"}),
+            html.Div([
+                grid
+            ], style={"flex":"0 0 70%"}),
+            dcc.Loading(
+                id="loading-output",
+                children=html.Div(id='save-output'),
+                type="circle"
+            )
+        ], style={"display":"flex","flex-direction":"column","height":"100%","overflow":"hidden"})
+
+        return edit_contents, True
+    return dash.no_update, dash.no_update
+
+@app.callback(
+    Output("assign-panel","children"),
+    Output("assign-panel","is_open"),
+    Output("assign-relevant-project","data"),
+    Input({"type":"assign-btn-dbc","index":dash.ALL}, "n_clicks"),
+    prevent_initial_call = True)
+def handle_assign_panel_state(assign_clicks):
+    triggered = ctx.triggered_id
+    
+    if not triggered or not isinstance(triggered,dict):
+        raise PreventUpdate
+    index = triggered["index"]
+    for i, btn in enumerate(ctx.inputs_list[0]):
+        if btn["id"]["index"] == index:
+            if not assign_clicks[i]:
+                raise PreventUpdate
+            break
+    else:
+        raise PreventUpdate
+         
+    project_data = projects_df[projects_df.ID == index]
+    roles_data = roles_df[roles_df.PROJECT_ID == index]
+    areas_data = areas_df[areas_df.PROJECT_ID == index]
+    
+    project_name = project_data["NAME"].iloc[0]
+    project_desc = project_data["DESCRIPTION"].iloc[0]
+    
+    
+    proj_pics = roles_data[roles_data['ROLE'] == 'Pilot in Command']['LAN_ID'].unique()
+    proj_atcs = roles_data[roles_data['ROLE'] == 'Air Traffic Controller']['LAN_ID'].unique()
+    proj_cms = roles_data[roles_data['ROLE'] == 'Crew Member']['LAN_ID'].unique()
+    proj_smes = roles_data[roles_data['ROLE'] == 'Subject Matter Expert']['LAN_ID'].unique()
+    proj_areas = areas_data['AREA_DESC'].unique()
+    
+    data_dict = {
+        "ID":index,
+        "PICS":proj_pics,
+        "ATCS":proj_atcs,
+        "CMS":proj_cms,
+        "SMES":proj_smes,
+        "AREAS":proj_areas
+    }
+    
+    pic_assign_dd = dcc.Dropdown(
+        id='pic-edit-dropdown',
+        multi=True,
+        value=proj_pics,
+        options = unique_users,
+        placeholder="",
+        searchable=True,
+        style=form_element_style
+    )
+    
+    atc_assign_dd = dcc.Dropdown(
+        id='atc-edit-dropdown',
+        multi=True,
+        value=proj_atcs,
+        options = unique_users,
+        placeholder="",
+        searchable=True,
+        style=form_element_style
+    )
+    
+    sme_assign_dd = dcc.Dropdown(
+        id='sme-edit-dropdown',
+        multi=True,
+        value=proj_smes,
+        options = unique_users,
+        placeholder="",
+        searchable=True,
+        style=form_element_style
+    )
+    
+    cm_assign_dd = dcc.Dropdown(
+        id='cm-edit-dropdown',
+        multi=True,
+        value=proj_cms,
+        options = unique_users,
+        placeholder="",
+        searchable=True,
+        style=form_element_style
+    )
+    
+    areas_assign_dd = dcc.Dropdown(
+        id='areas-edit-dropdown',
+        multi=True,
+        value=proj_areas,
+        options = areas_options,
+        placeholder="",
+        searchable=True,
+        style=form_element_style
+    )
+    
+    if not project_data.empty:
+        assign_contents = html.Div(
+            style={
+                "backgroundColor":"#F7f9fc",
+                "minHeight":"100%",
+                "padding":"40px",
+                "fontFamily":"Segoe UI, Roboto, sans-serif"
+            },
+            children=[
+                html.Div([
+                    html.H3(f"{project_name}", style={
+                        "fontSize":"24px",
+                        "marginBottom":"10px",
+                        "color":"#2c3e50"
+                    }),
+                    html.P(f"Assign PWOW roles or GSC areas to project", style={
+                        "fontSize":"12px",
+                        "color":"#6c747d"
+                    }), 
+                ], style={"marginBottom":"40px"}),
+                
+                html.Div([
+                    dbc.Row([
+                        dbc.Col([
+                            html.Div([
+                                html.Label("Select Pilot in Command(s)", style={"fontWeight":"bold"}),
+                                pic_assign_dd,
+                            ], className="input-card")
+                        ], md=4),
+                        
+                        dbc.Col([
+                            html.Div([
+                                html.Label("Select Air Traffic Controller(s)", style={"fontWeight":"bold"}),
+                                atc_assign_dd
+                            ], className="input-card")
+                        ], md=4),
+                        
+                        
+                        dbc.Col([
+                            html.Div([
+                                html.Label("Select Crew Member(s)", style={"fontWeight":"bold"}),
+                                cm_assign_dd
+                            ], className="input-card")
+                        ], md=4),
+                        
+                        dbc.Col([
+                            html.Div([
+                                html.Label("Select Subject Matter Expert(s)", style={"fontWeight":"bold"}),
+                                sme_assign_dd
+                            ], className="input-card")
+                        ], md=4),
+                        
+                        dbc.Col([
+                            html.Div([
+                                html.Label("Select Area(s) Involved", style={"fontWeight":"bold"}),
+                                areas_assign_dd
+                            ], className="input-card")
+                        ], md=4)
+                        
+                    ]),
+                    
+                    html.Div(id="assign-output-div")
+                ])
+            ]
+        )
+            
+
+        return assign_contents, True, data_dict
+    return dash.no_update, dash.no_update, dash.no_update
+
+@app.callback(
+    Output('save-output','children'),
+    Input('edit-grid-dbc','cellValueChanged'),
+    prevent_initial_call=True)
+def process_cell_change(changed_data):
+    
+    if not changed_data:
+        raise dash.exceptions.PreventUpdate
+        
+    if isinstance(changed_data, list):
+        changed_data = changed_data[0]
+        
+    col_id = changed_data.get("colId")
+    pre_val = changed_data.get("oldValue")
+    
+    new_val = changed_data.get("value")
+    print(new_val)
+    row_data = changed_data.get("data")
+    
+    if pre_val == new_val:
+        raise dash.exceptions.PreventUpdate
+    
+    if not isinstance(row_data, dict):
+        return "ROW DATA IS NOT A DICT!!!"
+    
+    proj_id = row_data.get("ID")
+    
+    request_headers=dict(request.headers)
+    auth_info_browser=client.get_auth_info_from_browser_headers(request_headers)
+    logging.info((auth_info_browser))
+    logged_user = auth_info_browser["authIdentifier"]
+    
+    output_table = dataiku.Dataset("EDITS_TO_PROCESS")
+    output_df = output_table.get_dataframe()
+    
+    project = client.get_project("CXC")
+    variables = project.get_variables()
+        
+    variables["standard"]["var_proid"] = proj_id
+    variables["standard"]["var_field"] = col_id
+    variables["standard"]["var_value"] = new_val
+    
+    project.set_variables(variables)
+    vals_scenario = project.get_scenario("PVT_UPDATE_VALUES")
+    null_scenario = project.get_scenario("PVT_UPDATE_NULLS")
+    logs_scenario = project.get_scenario("COMMIT_CHANGES")
+    
+    if new_val is None:
+        null_scenario.run_and_wait()
+    else:
+        vals_scenario.run_and_wait()
+    
+    user = logged_user
+
+    records = []
+
+    record = {
+        'ROWINDEX': 0,
+        'FIELD_TO_UPDATE': col_id,
+        'NEWVALUE': new_val,
+        'ROW_ID': proj_id,
+        'USER': user,
+        'TIMESTAMP': dt.datetime.now(),
+    }
+
+    records.append(record)
+    
+    changed_df = pd.DataFrame.from_records(records)
+    output_df = pd.concat([output_df, changed_df], ignore_index = True)
+    output_table.write_with_schema(output_df,drop_and_create=True)
+    logs_scenario.run_and_wait()
+    return f"Change saved: Project {proj_id}'s {col_id} field has been set to {new_val}"
+
+
+@app.callback(
+    Output("new-panel","is_open"),
+    Input("btn-new","n_clicks"),
+    
+)
+def toggle_new_offcanvas(n):
+    if n:
+        return True
+
+input_ids = [
+    "new-proj-name",
+    "new-proj-tier",
+    "new-proj-dim",
+    "new-proj-prin",
+    "new-proj-init",
+    "new-proj-status",
+    "new-proj-stage",
+    "new-proj-risk",
+    "new-proj-start",
+    "new-proj-due"
+]    
+@app.callback(
+    [
+        Output("new-proj-submit","disabled"),
+        Output("new-proj-name","invalid"),
+        Output("new-proj-tier","invalid"),
+        Output("new-proj-dim","invalid"),
+        Output("new-proj-prin","invalid"),
+        Output("new-proj-init","invalid"),
+        Output("new-proj-status","invalid"),
+        Output("new-proj-stage","invalid"),
+        Output("new-proj-risk","invalid"),
+        Output("new-proj-start","invalid"),
+        Output("new-proj-due","invalid"),
+        Output("new-proj-init","options")
+    ],
+    [
+        Input("new-proj-name","value"),
+        Input("new-proj-tier","value"),
+        Input("new-proj-dim","value"),
+        Input("new-proj-prin","value"),
+        Input("new-proj-init","value"),
+        Input("new-proj-status","value"),
+        Input("new-proj-stage","value"),
+        Input("new-proj-risk","value"),
+        Input("new-proj-start","value"),
+        Input("new-proj-due","value")
+    ]
+)
+
+def toggle_button(name, tier, dim, prin, init, status, stage, risk, start, due):
+    btn_dis = not all(val not in [None,""] for val in [name, tier, dim, prin, init, status, stage, risk, start, due])
+    name_inv = name is None
+    tier_inv = tier is None
+    dim_inv = dim is None
+    prin_inv = prin is None
+    init_inv = init is None
+    status_inv = status is None
+    stage_inv = stage is None
+    risk_inv = risk is None
+    start_inv = start is None
+    due_inv = due is None
+    
+    filtered_options = blueprint_data[blueprint_data['principle'] == prin]['initiative'].unique()
+    new_options = [{"label":i, "value":i} for i in filtered_options]
+    
+    return btn_dis, name_inv, tier_inv, dim_inv, prin_inv, init_inv, status_inv, stage_inv, risk_inv, start_inv, due_inv, new_options
+
+
+
+@app.callback(
+    Output("save-attempt-output","children"),
+    Output("new-proj-name","value"),
+    Output("new-proj-tier","value"),
+    Output("new-proj-dim","value"),
+    Output("new-proj-prin","value"),
+    Output("new-proj-init","value"),
+    Output("new-proj-status","value"),
+    Output("new-proj-stage","value"),
+    Output("new-proj-risk","value"),
+    Output("new-proj-start","value"),
+    Output("new-proj-due","value"),
+    Output("new-proj-exp","value"),
+    Output("new-proj-desc","value"),
+    Output("new-proj-team","value"),
+    Output("new-proj-dig_team","value"),
+    Output("new-proj-scope","value"),
+    Output("new-proj-nextgen","value"),
+    Output("new-proj-budget","value"),
+    Output("new-proj-comments","value"),
+    
+    
+    Input("new-proj-submit","n_clicks"),
+    State("new-proj-name","value"),
+    State("new-proj-tier","value"),
+    State("new-proj-dim","value"),
+    State("new-proj-prin","value"),
+    State("new-proj-init","value"),
+    State("new-proj-status","value"),
+    State("new-proj-stage","value"),
+    State("new-proj-risk","value"),
+    State("new-proj-start","value"),
+    State("new-proj-due","value"),
+    State("new-proj-exp","value"),
+    State("new-proj-desc","value"),
+    State("new-proj-team","value"),
+    State("new-proj-dig_team","value"),
+    State("new-proj-scope","value"),
+    State("new-proj-nextgen","value"),
+    State("new-proj-budget","value"),
+    State("new-proj-comments","value"),
+    prevent_initial_call=True
+)
+
+def submit_new_projects(n, name, tier, dim, prin, init, status, stage, risk, start, due, exp, desc, team, dig_team, scope, nextgen, budget, comments):
+    if n is None:
+        raise PreventUpdate
+        
+    records = []
+
+    record = {
+        'NAME':name,
+        'DESCRIPTION':desc,
+        'TEAM':team,
+        'TIER':tier,
+        'IS_EXPEDITED':exp,
+        'SCOPE':scope,
+        'DIGITAL_TEAM':dig_team,
+        'PRINCIPLE':prin,
+        'INITIATIVE':init,
+        'BUDGET':budget,
+        'COMMENTS':comments,
+        'PIC_COMMETS':comments,
+        'STATUS':status,
+        'STAGE':stage,
+        'RISK':risk,
+        'DIMENSION':dim,
+        'PLANNED_START_DATE':start,
+        'PLANNED_END_DATE':due,
+        'ACTUAL_START_DATE':start,
+        'ACTUAL_END_DATE':due,
+        'IS_NEXTGEN':nextgen
+    }
+
+    records.append(record)
+    
+    changed_df = pd.DataFrame.from_records(records)
+    
+    output_table = dataiku.Dataset("PROJECT_LOGGER")
+    output_df = output_table.get_dataframe()
+    
+    output_df = pd.concat([output_df, changed_df], ignore_index = True)
+    output_table.write_with_schema(output_df,drop_and_create=True)
+
+    creation_scenario = project.get_scenario("PVT_LOG_NEW_PROJECTS")
+    creation_scenario.run_and_wait()
+    
+    
+    result_div = dcc.Loading(
+        type="graph",
+        children=html.Div([
+            dbc.Alert(f"The {name} project has been succesfully created!", color="success", duration=4000),
+        ]) 
+    )
+    
+    return result_div,None,None,None,None,None,None,None,None,None,None,None,None,None,None,None,None,None,None
+
+
+@app.callback(
+    Output('list-output-div','children'),
+    Input('pm-table','cellValueChanged'),
+    prevent_initial_call=True)
+def process_cell_change(changed_data):
+    
+    if not changed_data:
+        raise dash.exceptions.PreventUpdate
+        
+    if isinstance(changed_data, list):
+        changed_data = changed_data[0]
+        
+    col_id = changed_data.get("colId")
+    pre_val = changed_data.get("oldValue")
+    
+    new_val = changed_data.get("value")
+    row_data = changed_data.get("data")
+    
+    if pre_val == new_val:
+        raise dash.exceptions.PreventUpdate
+    
+    if not isinstance(row_data, dict):
+        return "ROW DATA IS NOT A DICT!!!"
+    
+    proj_id = row_data.get("ID")
+    name = row_data.get("NAME")
+    
+    request_headers=dict(request.headers)
+    auth_info_browser=client.get_auth_info_from_browser_headers(request_headers)
+    logging.info((auth_info_browser))
+    logged_user = auth_info_browser["authIdentifier"]
+    
+    output_table = dataiku.Dataset("EDITS_TO_PROCESS")
+    output_df = output_table.get_dataframe()
+    
+    project = client.get_project("CXC")
+    variables = project.get_variables()
+        
+    variables["standard"]["var_proid"] = proj_id
+    variables["standard"]["var_field"] = col_id
+    variables["standard"]["var_value"] = new_val
+    
+    project.set_variables(variables)
+    vals_scenario = project.get_scenario("PVT_UPDATE_VALUES")
+    null_scenario = project.get_scenario("PVT_UPDATE_NULLS")
+    logs_scenario = project.get_scenario("COMMIT_CHANGES")
+    
+    if new_val is None:
+        null_scenario.run_and_wait()
+    else:
+        vals_scenario.run_and_wait()
+    
+    user = logged_user
+
+    records = []
+
+    record = {
+        'ROWINDEX': 0,
+        'FIELD_TO_UPDATE': col_id,
+        'NEWVALUE': new_val,
+        'ROW_ID': proj_id,
+        'USER': user,
+        'TIMESTAMP': dt.datetime.now(),
+    }
+
+    records.append(record)
+    
+    changed_df = pd.DataFrame.from_records(records)
+    output_df = pd.concat([output_df, changed_df], ignore_index = True)
+    output_table.write_with_schema(output_df,drop_and_create=True)
+    logs_scenario.run_and_wait()
+    
+    div = html.Div([
+        dbc.Alert(f"Changes to project '{name}' have been succesfully stored: field {col_id} has been set to {new_val} from {pre_val}", color="success", duration=4000),
+    ])
+    return div
+
+
+
+
+
+#####################################################
+#####################################################
+#####################################################
+############TODO: VALIDATE CALLBACKS BELOW###########
+#####################################################
+#####################################################
+#####################################################
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    
+@app.callback(
+    Output("pic-dropdown", "options"),
+    Input("pic-dropdown", "search_value"),
+    State("pic-dropdown", "value"))
+def update_multi_options(search_value, value):
+    if not search_value:
+        raise PreventUpdate
+    return [
+        o for o in user_options if search_value.lower() in o["label"].lower() or o["value"] in (value or [])
+    ]
+
+@app.callback(
+    Output("atc-dropdown", "options"),
+    Input("atc-dropdown", "search_value"),
+    State("atc-dropdown", "value"))
+def update_multi_options(search_value, value):
+    if not search_value:
+        raise PreventUpdate
+    return [
+        o for o in user_options if search_value.lower() in o["label"].lower() or o["value"] in (value or [])
+    ]
+
+@app.callback(
+    Output("crew-dropdown", "options"),
+    Input("crew-dropdown", "search_value"),
+    State("crew-dropdown", "value"))
+def update_multi_options(search_value, value):
+    if not search_value:
+        raise PreventUpdate
+    return [
+        o for o in user_options if search_value.lower() in o["label"].lower() or o["value"] in (value or [])
+    ]
+
+#@app.callback(
+#    Output('charter-content','children'),
+#    Input('charter-project','value'))
+#def update_charter(project):
+#    charter_df = initial_df[initial_df['NAME'] == project]
+#    
+#    if charter_df.empty:
+#        return html.Div("No data available for this project")
+#    row = charter_df.iloc[0]
+#    
+#    def get_status_icon(status):
+#        icon_map = {
+#            "In Progress": "🟢",
+#            "Not Started": "🟡",
+#            "Closed": "⚫"
+#        }
+#        
+#        return html.Span(icon_map.get(status,'⚫'))
+    
+#    def get_initiative_color(initiative):
+#        color_map = {
+#            "Trust is Everything":"#FF6600",
+#            "Science Will Win":"#0095FF",
+#            "Disruption Calls for Innovation":"#12B000",
+#            "Time is Life":"#9369FF",
+#            "Execution Makes the Difference":"#00B7A5"
+#        }
+        
+#        return color_map.get(initiative,"#FFFFFF")  
+    
+#    table1 = html.Table([
+#        html.Tr([html.Th("Pilot in Command", style={'width':'50%'}), html.Th("Air Traffic Controller", style={'width':'50%'})]),
+#        html.Tr([html.Td(row["Pilot in Command"], style={'width':'50%'}), html.Td(row["Air Traffic Controller"], style={'width':'50%'})])],
+#    style={'padding':'10px'})
+    
+#    table2 = html.Table([
+#        html.Tr([
+#            html.Th([
+#                html.Span("Initiative / Project Description [",style ={'color':'black','font-weight':'medium'}),
+#                html.Span("WHAT",style={'color':'#0000C1','font-weight':'bold'}),
+#                html.Span("]",style ={'color':'black','font-weight':'medium'}),
+#            ])
+#        ]),
+#        html.Tr([html.Td(row["NAME"])])])
+    
+#    table3 = html.Table([
+#        html.Tr([
+#            html.Th([
+#                html.Span("Background/Business Case [",style ={'color':'black','font-weight':'medium'}),
+#                html.Span("WHY",style={'color':'#F3B51A','font-weight':'bold'}),
+#                html.Span("]",style ={'color':'black','font-weight':'medium'}),
+#            ])
+#        ]),
+#        html.Tr([html.Td(row["DESCRIPTION"])])])
+    
+#    table4 = html.Table([
+#        html.Tr([
+#            html.Th([
+#                html.Span("Team Members [",style ={'color':'black','font-weight':'medium'}),
+#                html.Span("WHO",style={'color':'#C82435','font-weight':'bold'}),
+#                html.Span("]",style ={'color':'black','font-weight':'medium'}),
+#            ])
+#        ]),
+#        html.Tr([html.Td(row["Crew Member"])])])
+    
+#    table5 = html.Table([
+#        html.Tr([html.Th("In-Scope", style={'width':'50%'}), html.Th("Out-of-Scope", style={'width':'50%'})]),
+#        html.Tr([html.Td(row["SCOPE"], style={'width':'50%'}), html.Td(row["COMMENTS"], style={'width':'50%'})])])
+    
+#    table6 = html.Table([
+#        html.Tr([html.Th("Risk & Considerations")]),
+#        html.Tr([html.Td(row["RISK"])])])
+    
+#    table7 = html.Table([
+#        html.Tr([html.Th("Metrics")]),
+#        html.Tr([html.Td(row["PIC_COMMETS"])])])
+    
+#    left_column_content = html.Div([
+#        table1, html.Hr(),
+#        table2, html.Hr(),
+#        table3, html.Hr(),
+#        table4, html.Hr(),
+#        table5, html.Hr(),
+#        table6, html.Hr(),
+#        table7
+#    ], style = {'width':'48%','border-collapse':'collapse','padding':'10px'})
+    
+#    right_column_content = html.Table([
+#        html.Tr([html.Th("Key Milestones"),html.Th("Target Finish"),html.Th("Actual Finish"),html.Th("Status")]),
+#        html.Tr([html.Td("Milestone 1"), html.Td(row['PLANNED_END_DATE_FMT']), html.Td(row['ACTUAL_END_DATE_FMT']), html.Td(get_status_icon(row['STATUS']))]),
+#        html.Tr([html.Td("Milestone 1"), html.Td(row['PLANNED_END_DATE_FMT']), html.Td(row['ACTUAL_END_DATE_FMT']), html.Td(get_status_icon(row['STATUS']))]),
+#        html.Tr([html.Td("Milestone 1"), html.Td(row['PLANNED_END_DATE_FMT']), html.Td(row['ACTUAL_END_DATE_FMT']), html.Td(get_status_icon(row['STATUS']))]),
+#        html.Tr([html.Td("Milestone 1"), html.Td(row['PLANNED_END_DATE_FMT']), html.Td(row['ACTUAL_END_DATE_FMT']), html.Td(get_status_icon(row['STATUS']))]),
+#        html.Tr([html.Td("Milestone 1"), html.Td(row['PLANNED_END_DATE_FMT']), html.Td(row['ACTUAL_END_DATE_FMT']), html.Td(get_status_icon(row['STATUS']))]),
+#        html.Tr([html.Td("Milestone 1"), html.Td(row['PLANNED_END_DATE_FMT']), html.Td(row['ACTUAL_END_DATE_FMT']), html.Td(get_status_icon(row['STATUS']))]),
+#    ], style = {'width':'48%','border-collapse':'collapse','padding':'10px'})
+    
+#    return html.Div([
+#        html.Div([
+#            html.Img(src="https://brandid.pfizer.com/sites/default/files/images/logo-hierarchy-left.png", style={'width':"auto",'height':'50px'}),
+#            html.H5(f"{row['NAME']}: Project Charter", style={'width':'65%'}),
+#            html.Div(html.Span(f"{row['PRINCIPLE']}", style={'font-size':'12px','text-align':'center','font-weight':'bold','color':'#FFFFFF'}), style={
+#                'display': 'inline-block',
+#                'justify-content':'center',
+#                'width':'15%',
+#                'margin':'3px',
+#                'padding':'10px',
+#                'background-color':get_initiative_color(row['PRINCIPLE']),
+#                'align-content': 'end'
+#            })
+#        ], style={'display':'flex','align-items':'center'}),
+#    
+#        
+#        
+#        html.Div([
+#            html.Div(html.P(' '),style={'background-color':'#0000C1','display': 'inline-block','width':'20%','height':'8px'}),
+#            html.Div(html.P(' '),style={'background-color':'#2BA7FF','display': 'inline-block','width':'80%','height':'8px'}),
+#        ],style={'height':'8px'}),
+#        html.Div([
+#            left_column_content,
+#            right_column_content
+#        ],
+#        style ={'display':'flex','justify-content':'space-between','height':'450px'})])
+
+@app.callback(
+    Output('initiatives-list-layout-content','children'),
+    Input({'type':'badge', 'initiative': dash.ALL, 'principle': dash.ALL},'n_clicks'),
+    Input('filter-project-mode','data'),
+    State({'type':'badge', 'initiative': dash.ALL, 'principle': dash.ALL},'id'))
+def update_filtered_table(n_clicks_list, filter_mode,id_list):
+    triggered = ctx.triggered_id
+    if triggered is None:
+        return html.Div("Click a badge to see details..", className="text-muted")
+    
+    request_headers=dict(request.headers)
+    auth_info_browser=client.get_auth_info_from_browser_headers(request_headers)
+    logging.info((auth_info_browser))
+    logged_user = auth_info_browser["authIdentifier"].upper()
+    
+    initial_df = create_enriched_projects_df()
+    
+    filtered_projects = initial_df.copy()
+    
+    if filter_mode == "mine":
+        filtered_projects = projects_df[projects_df.ID.isin(
+            roles_df[roles_df.LAN_ID == logged_user].PROJECT_ID
+        )]
+    elif filter_mode == "team":
+        filtered_users = users_df[users_df.LEAD_LAN_ID == logged_user].LAN_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            roles_df[roles_df.LAN_ID.isin(filtered_users)].PROJECT_ID
+        )]
+    elif filter_mode == "off":
+        selected_projects = projects_df[projects_df.RISK == "Off Track"].PROJECT_ID
+        
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )] 
+    elif filter_mode == "on":
+        selected_projects = projects_df[projects_df.RISK == "On Track"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )]
+    elif filter_mode == "global":
+        selected_projects = projects_df[projects_df.REGION == "Global"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )]
+    elif filter_mode == "amer":
+        selected_projects = projects_df[projects_df.REGION == "Americas"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )]
+    elif filter_mode == "noam":
+        selected_projects = projects_df[projects_df.REGION == "North America"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+        )]
+    elif filter_mode == "latam":
+        selected_projects = projects_df[projects_df.REGION == "Latin America"].PROJECT_ID
+        filtered_projects = projects_df[projects_df.ID.isin(
+            projects_df[projects_df.ID.isin(selected_projects)].ID
+       )]
+    else:
+        filtered_projects = projects_df
+    
+    
+    if filtered_projects.empty:
+        return []
+    
+    
+    
+    
+    initiative = triggered['initiative']
+    principle = triggered['principle']
+    
+    relevant_df = filtered_projects[['INITIATIVE','PRINCIPLE','NAME','DESCRIPTION','TIER','RISK','STATUS','TEAM','SCOPE']]
+    pi_filtered_df = relevant_df[(relevant_df['INITIATIVE'] == initiative) & (relevant_df['PRINCIPLE'] == principle)]
+    exclude = ['INITIATIVE','PRINCIPLE','RISK','COST_AVOIDANCE','COST_SAVINGS']
+
+    style_cell_conditional = [
+        {
+            'if':{'column_id':'NAME'},
+            'maxWidth':'220px',
+            'whiteSpace':'normal',
+            'height':'auto'
+        },
+        
+        {
+            'if':{'column_id':'DESCRIPTION'},
+            'maxWidth':'400px',
+            'whiteSpace':'normal',
+            'height':'auto'
+        }]
+    
+    custom_headers = {
+        'INITIATIVE':'Initiative',
+        'PRINCIPLE':'Principle',
+        'NAME':'Project Name',
+        'DESCRIPTION':'Project Description',
+        'PILOT_IN_COMMAND':'Pilot in Command',
+        'AIR_TRAFFIC_CONTROLLERS':'Air Traffic Controller',
+        'TIER':'Tier',
+        'RISK':'Risk',
+        'STATUS':'Status',
+        'TEAM':'Team',
+        'SCOPE':'Scope',
+        'COST_AVOIDANCE':'Cost Avoidance',
+        'COST_SAVINGS':'Cost Savings'}
+    
+    return dash_table.DataTable(
+        data=pi_filtered_df.to_dict('records'),
+        columns =[{'name': custom_headers[col], 'id': col} for col in pi_filtered_df if col not in exclude],
+        style_table={'marginTop':'20px','overflowX':'auto'},
+        style_cell={'textAlign':'left','padding':'8px', 'font-size':'12px', 'fontFamily':'Arial'},
+        style_header={'backgroundColor':'#f8f9fa', 'fontWeight':'bold','font-size':'12px', 'fontFamily':'Arial'},
+        style_cell_conditional=style_cell_conditional
+    )
+
+@app.callback(
+    Output('filtered-dimension-container','children'),
+    Input('dimension-grid','cellClicked'),)
+def update_filtered_dimension(cell):
+    if cell is None or 'value' not in cell:
+        return []
+    selected_value = cell['value']
+    relevant_df = projects_df[['INITIATIVE','PRINCIPLE','NAME','DESCRIPTION','DIMENSION','TIER','RISK','STATUS','TEAM','SCOPE']]
+
+    custom_headers = {
+        'INITIATIVE':'Initiative',
+        'PRINCIPLE':'Principle',
+        'NAME':'Project Name',
+        'DESCRIPTION':'Project Description',
+        'PILOT_IN_COMMAND':'Pilot in Command',
+        'AIR_TRAFFIC_CONTROLLERS':'Air Traffic Controller',
+        'TIER':'Tier',
+        'RISK':'Risk',
+        'STATUS':'Status',
+        'TEAM':'Team',
+        'SCOPE':'Scope',
+        'COST_AVOIDANCE':'Cost Avoidance',
+        'COST_SAVINGS':'Cost Savings'}   
+    dimension_filtered_df = relevant_df[relevant_df['DIMENSION'] == selected_value]
+    exclude = ['DIMENSION','INITIATIVE','PRINCIPLE','RISK']
+    return dash_table.DataTable(
+        data=dimension_filtered_df.to_dict('records'),
+        columns =[{'name': custom_headers[col], 'id': col} for col in dimension_filtered_df if col not in exclude],
+        style_table={'marginTop':'20px','overflowX':'auto'},
+        style_cell={'textAlign':'left','padding':'8px', 'font-size':'10px', 'fontFamily':'Arial'},
+        style_header={'backgroundColor':'#f8f9fa', 'fontWeight':'bold','font-size':'10px', 'fontFamily':'Arial'},
+        page_size=10
+    )
+
+@app.callback(
+    Output('roadmap-scatter-plot', 'figure'),
+    Output('roadmap-quant-plot','figure'),
+    Output('roadmap-quant-month','figure'),
+    Input('color-dropdown', 'value'))
+def update_scatter_color(selected_color):
+    fig = px.scatter(
+        df_roadmap,
+        x='END_MONTH',
+        y='SCATTER_INDEX',
+        color=selected_color,
+        color_discrete_map={selected_color: 'red'},
+        category_orders={'color_values': [selected_color]},
+        size=[10]*len(df_roadmap),
+        custom_data = df_roadmap[['NAME','ID']],
+        text="ID",
+        
+    )
+    
+    fig.update_traces(
+        marker=dict(size=10,line=dict(width=5,color='#FFFFFF'),opacity=0.6),
+        selector=dict(mode='markers'),
+        textposition='center'
+    )
+    
+    for trace in fig.data:
+        trace.hovertemplate = (
+            "<b>Project:</b> %{customdata[0]}<br>"
+        )
+        
+    fig.update_layout(
+        clickmode='event+select',
+        legend=dict(orientation="h",yanchor="top",y=-0.2,xanchor="left",x=0),
+        xaxis_title=None
+    )
+
+    fig.update_yaxes(visible=False)
+    fig.update_xaxes(dtick="M1",tickformat="%b\n%Y")
+    
+    role_dist = user_roles_df.groupby(['FULL_NAME','ROLE']).size().reset_index(name='count')
+    role_dist.sort_values(by=['count'])
+    
+    
+    quant_fig = px.bar(
+        role_dist,
+        x = 'FULL_NAME',
+        y='count',
+        color='ROLE',
+        text='count',
+        title='Projects per User'
+    )
+    
+    quant_fig.update_layout(
+        clickmode='event+select',
+        legend=dict(orientation="h",yanchor="top",y=-0.2,xanchor="left",x=0),
+        xaxis_title=None,
+        yaxis_title=None
+    )
+    
+    quant_fig.update_layout(barmode='stack',xaxis_title='User', yaxis_title='Count of Rows')
+    quant_totals = role_dist.groupby('FULL_NAME')['count'].sum().reset_index()
+    
+    
+    
+    for i, row in quant_totals.iterrows():
+        quant_fig.add_annotation(
+            x=row['FULL_NAME'],
+            y=row['count']+1,
+            text=str(row['count']),
+            showarrow=False,
+            font=dict(size=12,color="black")
+        )
+        
+    quant_fig.update_layout(
+        clickmode='event+select',
+        legend=dict(orientation="h",yanchor="top",y=-1.2,xanchor="left",x=0),
+        xaxis_title=None,
+        yaxis_title=None
+    )
+    
+    
+    projects_df['MONTH'] = pd.to_datetime(projects_df['ACTUAL_END_DATE']).dt.to_period('M').astype(str)
+    monthly_counts = projects_df.groupby('MONTH').size().reset_index(name='count')
+    month_quant_fig = px.bar(
+        monthly_counts,
+        x = 'MONTH',
+        y='count',
+        text='count',
+        title='Projects per Planned Due Month'
+    )
+    
+    month_quant_fig.update_layout(
+        clickmode='event+select',
+        legend=dict(orientation="h",yanchor="top",y=-0.2,xanchor="left",x=0),
+        xaxis_title=None,
+        yaxis_title=None
+    )
+    
+    return fig, quant_fig, month_quant_fig
+
+@app.callback(
+    Output('user_output', 'children'),
+    [Input('user_dummy', 'children')])
+def get_logged_user(_):
+    request_headers = dict(request.headers)
+    auth_info_browser = dataiku.api_client().get_auth_info_from_browser_headers(request_headers)
+    logging.info((auth_info_browser))
+    logged_username = auth_info_browser["authIdentifier"]
+    div_user = html.Div([
+        html.Label(f"Hello, {logged_username}")
+    ], style = {'display': 'flex',  'flex-wrap': 'nowrap','text-align': 'center'})
+    return div_user
+
+@app.callback(
+    Output('tabs-content-example-graph', 'children'),
+    Input('tabs-example-graph', 'value'))
+def render_content(tab):
+    if tab == 'home_tab_upcoming':
+        return html.Div([
+            html.H3('Tab content 1'),
+            dcc.Graph(
+                figure={
+                    'data': [{
+                        'x': [1, 2, 3],
+                        'y': [3, 1, 2],
+                        'type': 'bar'
+                    }]
+                }
+            )
+        ])
+    elif tab == 'home_tab_overdue':
+        return html.Div([
+            html.H3('Tab content 2'),
+            dcc.Graph(
+                id='graph-2-tabs-dcc',
+                figure={
+                    'data': [{
+                        'x': [1, 2, 3],
+                        'y': [5, 10, 6],
+                        'type': 'bar'
+                    }]
+                }
+            )
+        ])
+    
+    
+    elif tab == 'home_tab_completed':
+        return html.Div([
+            html.H3('Tab content 3'),
+            dcc.Graph(
+                id='graph-2-tabs-dcc',
+                figure={
+                    'data': [{
+                        'x': [1, 2, 3],
+                        'y': [5, 10, 6],
+                        'type': 'bar'
+                    }]
+                }
+            )
+        ])  
+    
+
+    
+@app.callback(
+    Output('country-grid','rowData'),
+    Input('region-grid','selectedRows')
+)
+
+def update_country_grid(selected):
+    if selected and len(selected) > 0:
+        selected_region = selected[0]['REGION']
+        filtered = country_summary[country_summary['REGION'] == selected_region]
+        return filtered.drop(columns = 'REGION').to_dict('records')
+    
+    
+    
+@app.callback(
+    Output("assign-output-div","children"),
+    Input("pic-edit-dropdown","value"),
+    Input("atc-edit-dropdown","value"),
+    Input("sme-edit-dropdown","value"),
+    Input("cm-edit-dropdown","value"),
+    Input("areas-edit-dropdown","value"),
+    State("assign-relevant-project","data"),
+    prevent_initial_call = True
+)
+
+def process_assignments(pic,atc,sme,cm,area, data):
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return dash.no_update
+    updated_element = ctx.triggered[0]['prop_id'].split('.')[0]
+    
+    proj_id = data["ID"]
+    
+    
+    
+    delete_records_table = dataiku.Dataset("ROLES_TO_REMOVE")
+    delete_records_df = delete_records_table.get_dataframe()
+    
+    add_areas_table = dataiku.Dataset("AREAS_TO_ADD")
+    add_areas_df = add_areas_table.get_dataframe()
+    
+    delete_areas_table = dataiku.Dataset("AREAS_TO_REMOVE")
+    delete_areas_df = delete_areas_table.get_dataframe()
+    
+    request_headers=dict(request.headers)
+    auth_info_browser=client.get_auth_info_from_browser_headers(request_headers)
+    logging.info((auth_info_browser))
+    logged_user = auth_info_browser["authIdentifier"]
+    
+    new_records = []
+    removed_records = []
+    new_areas = []
+    removed_areas = []
+    div=[]
+    
+    if updated_element == "pic-edit-dropdown":
+        prev_pics = set(data["PICS"])
+        sel_pics = set(pic)
+        matching = list(sel_pics.intersection(prev_pics))
+        not_found = list(sel_pics.difference(prev_pics))
+        removed = list(prev_pics - sel_pics)
+        
+        new_records = [{
+            "ROWINDEX":0,
+            "LAN_ID":user,
+            "PROJECT_ID":proj_id,
+            "ROLE":"Pilot in Command",
+            "USER":logged_user,
+            "TIMESTAMP": dt.datetime.now()
+        } for user in not_found]
+        
+        removed_records = [{
+            "ROWINDEX":0,
+            "LAN_ID":user,
+            "PROJECT_ID":proj_id,
+            "ROLE":"Pilot in Command",
+            "USER":logged_user,
+            "TIMESTAMP": dt.datetime.now()
+        } for user in removed]
+        
+    if updated_element == "atc-edit-dropdown":
+        prev_atcs = set(data["ATCS"])
+        sel_atcs = set(atc)
+        matching = list(sel_atcs.intersection(prev_atcs))
+        not_found = list(sel_atcs.difference(prev_atcs))
+        removed = list(prev_atcs - sel_atcs)
+        
+        new_records = [{
+            "ROWINDEX":0,
+            "LAN_ID":user,
+            "PROJECT_ID":proj_id,
+            "ROLE":"Air Traffic Controller",
+            "USER":logged_user,
+            "TIMESTAMP": dt.datetime.now()
+        } for user in not_found]
+        
+        removed_records = [{
+            "ROWINDEX":0,
+            "LAN_ID":user,
+            "PROJECT_ID":proj_id,
+            "ROLE":"Air Traffic Controller",
+            "USER":logged_user,
+            "TIMESTAMP": dt.datetime.now()
+        } for user in removed]
+        
+    if updated_element == "cm-edit-dropdown":
+        prev_cms = set(data["CMS"])
+        sel_cms = set(cm)
+        matching = list(sel_cms.intersection(prev_cms))
+        not_found = list(sel_cms.difference(prev_cms))
+        removed = list(prev_cms - sel_cms)
+        
+        new_records = [{
+            "ROWINDEX":0,
+            "LAN_ID":user,
+            "PROJECT_ID":proj_id,
+            "ROLE":"Crew Member",
+            "USER":logged_user,
+            "TIMESTAMP": dt.datetime.now()
+        } for user in not_found]
+        
+        removed_records = [{
+            "ROWINDEX":0,
+            "LAN_ID":user,
+            "PROJECT_ID":proj_id,
+            "ROLE":"Crew Member",
+            "USER":logged_user,
+            "TIMESTAMP": dt.datetime.now()
+        } for user in removed]
+        
+    if updated_element == "sme-edit-dropdown":
+        prev_smes = set(data["SMES"])
+        sel_smes = set(sme)
+        matching = list(sel_smes.intersection(prev_smes))
+        not_found = list(sel_smes.difference(prev_smes))
+        removed = list(prev_smes - sel_smes)
+        
+        new_records = [{
+            "ROWINDEX":0,
+            "LAN_ID":user,
+            "PROJECT_ID":proj_id,
+            "ROLE":"Subject Matter Expert",
+            "USER":logged_user,
+            "TIMESTAMP": dt.datetime.now()
+        } for user in not_found]
+        
+        removed_records = [{
+            "ROWINDEX":0,
+            "LAN_ID":user,
+            "PROJECT_ID":proj_id,
+            "ROLE":"Subject Matter Expert",
+            "USER":logged_user,
+            "TIMESTAMP": dt.datetime.now()
+        } for user in removed]
+        
+    if updated_element == "areas-edit-dropdown":
+        prev_areas = set(data["AREAS"])
+        sel_areas = set(area)
+        matching = list(sel_areas.intersection(prev_areas))
+        not_found = list(sel_areas.difference(prev_areas))
+        removed = list(prev_areas - sel_areas)
+        
+        new_areas = [{
+            "ROWINDEX":0,
+            "AREA_DESC":area,
+            "PROJECT_ID":proj_id,
+            "USER":logged_user,
+            "TIMESTAMP": dt.datetime.now()
+        } for area in not_found]
+        
+        removed_areas = [{
+            "ROWINDEX":0,
+            "AREA_DESC":area,
+            "PROJECT_ID":proj_id,
+            "USER":logged_user,
+            "TIMESTAMP": dt.datetime.now()
+        } for area in removed]  
+        
+    if new_records:
+        add_records_table = dataiku.Dataset("ROLES_TO_ADD")
+        add_records_df = add_records_table.get_dataframe()
+
+        new_records_df = pd.DataFrame.from_records(new_records)
+        add_records_df = pd.concat([add_records_df, new_records_df], ignore_index = True)
+        add_records_table.write_with_schema(add_records_df,drop_and_create=True)
+        
+        new_scenario = project.get_scenario("ADD_NEW_ROLES")
+        new_scenario.run_and_wait()
+
+        div = html.Div([
+            dbc.Alert(f"Changes have been succesfully stored", color="success", duration=4000),
+        ])
+    
+    if removed_records:
+        remove_records_table = dataiku.Dataset("ROLES_TO_REMOVE")
+        remove_records_df = remove_records_table.get_dataframe()
+
+        deleted_records_df = pd.DataFrame.from_records(removed_records)
+        remove_records_df = pd.concat([remove_records_df, deleted_records_df], ignore_index = True)
+        remove_records_table.write_with_schema(remove_records_df,drop_and_create=True)
+        
+        remove_scenario = project.get_scenario("DELETE_REMOVED_ROLES")
+        remove_scenario.run_and_wait()
+
+        div = html.Div([
+            dbc.Alert(f"Changes have been succesfully stored", color="success", duration=4000),
+        ])
+        
+    if new_areas:
+        add_areas_table = dataiku.Dataset("AREAS_TO_ADD")
+        add_areas_df = add_areas_table.get_dataframe()
+
+        new_areas_df = pd.DataFrame.from_records(new_areas)
+        add_areas_df = pd.concat([add_areas_df, new_areas_df], ignore_index = True)
+        add_areas_table.write_with_schema(add_areas_df,drop_and_create=True)
+        
+        add_scenario = project.get_scenario("ADD_NEW_AREAS")
+        add_scenario.run_and_wait()
+
+        div = html.Div([
+            dbc.Alert(f"Changes have been succesfully stored", color="success", duration=4000),
+        ])
+        
+    if removed_areas:
+        remove_areas_table = dataiku.Dataset("AREAS_TO_REMOVE")
+        remove_areas_df = remove_areas_table.get_dataframe()
+
+        deleted_areas_df = pd.DataFrame.from_records(removed_areas)
+        remove_areas_df = pd.concat([remove_areas_df, deleted_areas_df], ignore_index = True)
+        remove_areas_table.write_with_schema(remove_areas_df,drop_and_create=True)
+        
+        remove_scenario = project.get_scenario("REMOVE_DELETED_AREAS")
+        remove_scenario.run_and_wait()
+
+        div = html.Div([
+            dbc.Alert(f"Changes have been succesfully stored", color="success", duration=4000),
+        ])
+        
+        
+    
+    return div
